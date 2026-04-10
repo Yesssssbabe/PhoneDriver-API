@@ -7,6 +7,8 @@ A Python-based mobile automation agent that uses **Cloud Vision-Language APIs** 
 
 **No GPU required!** This fork replaces the original local Qwen3-VL model with API-based vision models.
 
+English | [简体中文](./README_CN.md)
+
 ## 🌟 Features
 
 - ☁️ **Cloud Vision Models**: Use Kimi K2.5, GPT-4V, Claude 3.5 Sonnet, or other VLM APIs
@@ -245,6 +247,14 @@ If you see `UnicodeEncodeError` in logs, run PowerShell as UTF-8:
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 python phone_agent.py "your task"
 ```
+
+## 💬 Join the Community
+
+Scan the QR code to add the author on WeChat and join our tech discussion group:
+
+<img src="wechat_qr.jpg" width="300" alt="WeChat QR Code">
+
+We welcome Issues and Pull Requests!
 
 ## 🙏 Acknowledgments
 
