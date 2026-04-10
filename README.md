@@ -248,6 +248,14 @@ If you see `UnicodeEncodeError` in logs, run PowerShell as UTF-8:
 python phone_agent.py "your task"
 ```
 
+## 👥 Contributors
+
+<a href="https://github.com/Yesssssbabe">
+  <img src="https://github.com/Yesssssbabe.png?size=100" width="50" height="50" style="border-radius:50%">
+</a>
+
+- **Yesssssbabe** - Creator & Maintainer ([@Yesssssbabe](https://github.com/Yesssssbabe))
+
 ## 💬 Join the Community
 
 Scan the QR code to add the author on WeChat (add note: **phonedriverapi**) and join our tech discussion group:

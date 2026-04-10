@@ -245,6 +245,14 @@ adb shell wm size
 python phone_agent.py "your task"
 ```
 
+## 👥 贡献者
+
+<a href="https://github.com/Yesssssbabe">
+  <img src="https://github.com/Yesssssbabe.png?size=100" width="50" height="50" style="border-radius:50%">
+</a>
+
+- **Yesssssbabe** - 创建者和维护者 ([@Yesssssbabe](https://github.com/Yesssssbabe))
+
 ## 💬 加入社区
 
 扫描二维码添加作者微信（**加好友备注：phonedriverapi**），加入技术交流群：
