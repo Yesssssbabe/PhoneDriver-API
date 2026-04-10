@@ -269,7 +269,16 @@ Have questions or suggestions? Feel free to reach out!
 
 ## 🙏 Acknowledgments
 
-- Original [PhoneDriver](https://github.com/OminousIndustries/PhoneDriver) by OminousIndustries
+### Project Contributors
+
+- **[@Yesssssbabe](https://github.com/Yesssssbabe)** - Creator & Maintainer of PhoneDriver-API
+
+### Original Project
+
+- **[@OminousIndustries](https://github.com/OminousIndustries)** - Original [PhoneDriver](https://github.com/OminousIndustries/PhoneDriver) author
+
+### API Providers
+
 - [Kimi](https://kimi.com) by Moonshot AI
 - [OpenRouter](https://openrouter.ai) for unified API access
 

@@ -266,7 +266,16 @@ python phone_agent.py "your task"
 
 ## 🙏 致谢
 
-- 原版 [PhoneDriver](https://github.com/OminousIndustries/PhoneDriver) by OminousIndustries
+### 项目贡献者
+
+- **[@Yesssssbabe](https://github.com/Yesssssbabe)** - PhoneDriver-API 的创建者和维护者
+
+### 原项目
+
+- **[@OminousIndustries](https://github.com/OminousIndustries)** - 原版 [PhoneDriver](https://github.com/OminousIndustries/PhoneDriver) 作者
+
+### API 提供商
+
 - [Kimi](https://kimi.com) by Moonshot AI
 - [OpenRouter](https://openrouter.ai) 提供统一 API 访问
 
