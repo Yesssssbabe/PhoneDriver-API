@@ -247,9 +247,11 @@ python phone_agent.py "your task"
 
 ## 💬 加入社区
 
-扫描二维码添加作者微信，加入技术交流群：
+扫描二维码添加作者微信（**加好友备注：phonedriverapi**），加入技术交流群：
 
 <img src="wechat_qr.jpg" width="300" alt="微信二维码">
+
+> **注意：** 添加好友时请备注 `phonedriverapi`
 
 欢迎提交 Issue 和 Pull Request！
 

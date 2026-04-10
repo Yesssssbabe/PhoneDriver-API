@@ -250,9 +250,11 @@ python phone_agent.py "your task"
 
 ## 💬 Join the Community
 
-Scan the QR code to add the author on WeChat and join our tech discussion group:
+Scan the QR code to add the author on WeChat (add note: **phonedriverapi**) and join our tech discussion group:
 
 <img src="wechat_qr.jpg" width="300" alt="WeChat QR Code">
+
+> **Note:** Please add `phonedriverapi` when sending friend request.
 
 We welcome Issues and Pull Requests!
 
