@@ -1,0 +1,13 @@
+# Core dependencies
+requests>=2.31.0
+Pillow>=10.0.0
+python-dotenv>=1.0.0
+
+# Web UI
+gradio>=4.0.0
+
+# Optional: For local model fallback (not required for API mode)
+# torch>=2.0.0
+# transformers>=4.40.0
+# qwen-vl-utils>=0.0.2
+# accelerate>=0.25.0
