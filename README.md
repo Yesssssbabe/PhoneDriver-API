@@ -256,15 +256,16 @@ python phone_agent.py "your task"
 
 - **Yesssssbabe** - Creator & Maintainer ([@Yesssssbabe](https://github.com/Yesssssbabe))
 
-## 💬 Join the Community
+## 💬 Contact
 
-Scan the QR code to add the author on WeChat (add note: **phonedriverapi**) and join our tech discussion group:
+Have questions or suggestions? Feel free to reach out!
+
+- **WeChat**: Scan the QR code below (add note: **phonedriverapi**)
+- **GitHub Issues**: [Create an issue](https://github.com/Yesssssbabe/PhoneDriver-API/issues)
 
 <img src="wechat_qr.jpg" width="300" alt="WeChat QR Code">
 
 > **Note:** Please add `phonedriverapi` when sending friend request.
-
-We welcome Issues and Pull Requests!
 
 ## 🙏 Acknowledgments
 

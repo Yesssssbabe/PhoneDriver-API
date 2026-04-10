@@ -253,15 +253,16 @@ python phone_agent.py "your task"
 
 - **Yesssssbabe** - 创建者和维护者 ([@Yesssssbabe](https://github.com/Yesssssbabe))
 
-## 💬 加入社区
+## 💬 联系方式
 
-扫描二维码添加作者微信（**加好友备注：phonedriverapi**），加入技术交流群：
+有问题或建议？欢迎联系！
+
+- **微信**：扫描下方二维码（**加好友备注：phonedriverapi**）
+- **GitHub Issues**：[创建 Issue](https://github.com/Yesssssbabe/PhoneDriver-API/issues)
 
 <img src="wechat_qr.jpg" width="300" alt="微信二维码">
 
 > **注意：** 添加好友时请备注 `phonedriverapi`
-
-欢迎提交 Issue 和 Pull Request！
 
 ## 🙏 致谢
 
