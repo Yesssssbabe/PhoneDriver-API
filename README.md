@@ -7,7 +7,7 @@ A Python-based mobile automation agent that uses **Cloud Vision-Language APIs** 
 
 **No GPU required!** This fork replaces the original local Qwen3-VL model with API-based vision models.
 
-English | [简体中文](./README_CN.md)
+English | [简体中文](./README_CN.md) | [繁體中文](./README_TW.md) | [日本語](./README_JP.md) | [한국어](./README_KR.md) | [Español](./README_ES.md)
 
 ## 🌟 Features
 
@@ -146,7 +146,12 @@ PhoneDriver-API/
 ├── config.json             # Device configuration (created by user)
 ├── .env                    # API keys (create from .env.example)
 ├── requirements.txt        # Python dependencies
-├── README.md              # This file
+├── README.md              # English documentation (this file)
+├── README_CN.md           # Simplified Chinese documentation
+├── README_TW.md           # Traditional Chinese documentation
+├── README_JP.md           # Japanese documentation
+├── README_KR.md           # Korean documentation
+├── README_ES.md           # Spanish documentation
 ├── LICENSE                # MIT License
 ├── providers/             # API provider implementations
 │   ├── __init__.py

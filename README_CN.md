@@ -7,7 +7,7 @@
 
 **无需 GPU！** 本项目将原始的本地 Qwen3-VL 模型替换为基于 API 的视觉模型。
 
-[English](./README.md) | 简体中文
+[English](./README.md) | 简体中文 | [繁體中文](./README_TW.md) | [日本語](./README_JP.md) | [한국어](./README_KR.md) | [Español](./README_ES.md)
 
 ## 🌟 特性
 
@@ -147,7 +147,11 @@ PhoneDriver-API/
 ├── .env                    # API 密钥（从 .env.example 创建）
 ├── requirements.txt        # Python 依赖
 ├── README.md              # 英文文档
-├── README_CN.md           # 中文文档（本文档）
+├── README_CN.md           # 简体中文文档（本文档）
+├── README_TW.md           # 繁体中文文档
+├── README_JP.md           # 日文文档
+├── README_KR.md           # 韩文文档
+├── README_ES.md           # 西班牙语文档
 ├── providers/             # API 提供商实现
 │   ├── __init__.py
 │   ├── base.py            # 基础提供商接口
