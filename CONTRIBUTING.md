@@ -34,18 +34,19 @@ Feature suggestions are welcome! Please:
 
 ```
 PhoneDriver-API/
-├── providers/        # API provider implementations
-│   ├── base.py       # Base provider class
-│   ├── kimi_code.py  # Kimi Code provider
-│   ├── openrouter.py # OpenRouter provider
-│   ├── openai_provider.py  # OpenAI provider
-│   └── moonshot.py   # Moonshot provider
-├── utils/            # Utility functions
-│   ├── adb.py        # ADB wrapper
-│   └── screenshot.py # Screenshot handling
-├── phone_agent.py    # Main CLI
-├── ui.py             # Gradio web UI
-└── config.json       # Configuration
+├── providers/             # API provider implementations
+│   ├── base.py            # Base provider class
+│   ├── kimi_code.py       # Kimi Code provider
+│   ├── openrouter.py      # OpenRouter provider
+│   ├── openai_provider.py # OpenAI provider
+│   └── moonshot.py        # Moonshot provider
+├── utils/                 # Utility functions
+│   ├── adb.py             # ADB wrapper
+│   └── screenshot.py      # Screenshot handling
+├── phone_agent.py         # Main CLI
+├── ui.py                  # Gradio web UI
+├── config.example.json    # Example configuration
+└── config.json            # User configuration
 ```
 
 ## Adding a New Provider

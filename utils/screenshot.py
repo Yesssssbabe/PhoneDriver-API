@@ -44,7 +44,7 @@ class ScreenshotCapture:
                     ratio = max_size / max(img.size)
                     new_size = tuple(int(dim * ratio) for dim in img.size)
                     img_resized = img.resize(new_size, Image.Resampling.LANCZOS)
-                    img_resized.save(path, quality=85)
+                    img_resized.save(path, optimize=True)
                     logging.info(f"Resized screenshot to {new_size}")
         except Exception as e:
             logging.warning(f"Failed to resize screenshot: {e}")

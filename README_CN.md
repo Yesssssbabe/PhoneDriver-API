@@ -127,23 +127,36 @@ python ui.py
 # 访问 http://localhost:7860
 ```
 
+### 配置文件
+
+复制示例配置文件：
+```bash
+cp config.example.json config.json
+```
+
+编辑 `config.json` 以匹配你的设备和偏好。默认会自动检测屏幕分辨率。
+
 ## 📁 项目结构
 
 ```
 PhoneDriver-API/
 ├── phone_agent.py          # 主 CLI 程序
 ├── ui.py                   # Gradio 网页界面
-├── config.json             # 设备配置
+├── config.example.json     # 示例设备配置
+├── config.json             # 设备配置（由用户创建）
 ├── .env                    # API 密钥（从 .env.example 创建）
 ├── requirements.txt        # Python 依赖
 ├── README.md              # 英文文档
 ├── README_CN.md           # 中文文档（本文档）
 ├── providers/             # API 提供商实现
+│   ├── __init__.py
+│   ├── base.py            # 基础提供商接口
 │   ├── kimi_code.py       # Kimi Code API
 │   ├── openrouter.py      # OpenRouter API
 │   ├── openai_provider.py # OpenAI API
 │   └── moonshot.py        # Moonshot AI API
 └── utils/                 # 工具函数
+    ├── __init__.py
     ├── adb.py             # ADB 封装
     └── screenshot.py      # 截图处理
 ```
@@ -177,6 +190,13 @@ adb shell wm size
 | `OPENAI_API_KEY` | OpenAI API 密钥 | 使用 OpenAI 时 |
 | `MOONSHOT_API_KEY` | Moonshot API 密钥 | 使用 Moonshot 时 |
 | `MODEL` | 模型名称（提供商特定） | 可选 |
+| `TEMPERATURE` | 采样温度 (0.0–1.0) | 可选 |
+| `MAX_TOKENS` | 每次 API 响应的最大 token 数 | 可选 |
+| `MAX_RETRIES` | API 调用重试次数 | 可选 |
+| `MAX_CYCLES` | 每个任务的最大执行轮数 | 可选 |
+| `STEP_DELAY` | 动作之间的间隔（秒） | 可选 |
+| `AUTO_DETECT_RESOLUTION` | 通过 ADB 自动检测屏幕尺寸 | 可选 |
+| `CHECK_COMPLETION` | 启用任务完成检测 | 可选 |
 
 ## 📝 使用示例
 
@@ -294,6 +314,15 @@ MIT License - 详见 [LICENSE](LICENSE) 文件。
 - [ ] 任务录制和回放
 - [ ] iOS 支持（通过 WebDriverAgent）
 - [ ] 多设备协调
+
+## 🐛 近期改进
+
+- 新增 `config.example.json` 和自动屏幕分辨率检测
+- 重构 provider 代码，减少重复并增加 API 重试机制
+- 使用 `shlex.quote` 修复文本输入转义，并增加剪贴板回退方案
+- 修复 PNG 截图保存参数（使用 `optimize=True` 替代不支持的 `quality`）
+- 新增任务完成检测并限制动作历史长度
+- 改进 `adb devices` 设备识别解析
 
 ---
 

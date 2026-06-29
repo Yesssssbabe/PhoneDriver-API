@@ -5,6 +5,7 @@ PhoneDriver API - Web UI using Gradio
 import json
 import logging
 import os
+import sys
 from pathlib import Path
 
 import gradio as gr
@@ -14,7 +15,13 @@ from phone_agent import PhoneAgent
 
 load_dotenv()
 
-logging.basicConfig(level=logging.INFO)
+# Configure logging only if not already configured
+if not logging.getLogger().handlers:
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        handlers=[logging.StreamHandler(sys.stdout)]
+    )
 
 
 def load_config():
@@ -32,13 +39,13 @@ def save_config(config):
         json.dump(config, f, indent=2)
 
 
-def run_task(task, provider, api_key, model, temperature, max_tokens):
+def run_task(task, provider, api_key, model, temperature, max_tokens, max_cycles, step_delay):
     """Run task with given configuration."""
     try:
         # Set environment variables
         os.environ['PROVIDER'] = provider
         os.environ['MODEL'] = model
-        
+
         if provider == 'kimi_code':
             os.environ['KIMI_CODE_API_KEY'] = api_key
         elif provider == 'openrouter':
@@ -47,18 +54,22 @@ def run_task(task, provider, api_key, model, temperature, max_tokens):
             os.environ['OPENAI_API_KEY'] = api_key
         elif provider == 'moonshot':
             os.environ['MOONSHOT_API_KEY'] = api_key
-        
+
         # Load and update config
         config = load_config()
         config['temperature'] = float(temperature)
         config['max_tokens'] = int(max_tokens)
-        
+        config['max_cycles'] = int(max_cycles)
+        config['step_delay'] = float(step_delay)
+        config['auto_detect_resolution'] = True
+        config['check_completion'] = True
+
         # Run agent
         agent = PhoneAgent(config)
         result = agent.execute_task(task)
-        
+
         return f"Result: {result['message']}"
-        
+
     except Exception as e:
         return f"Error: {str(e)}"
 
@@ -67,29 +78,29 @@ def run_task(task, provider, api_key, model, temperature, max_tokens):
 with gr.Blocks(title="PhoneDriver API") as demo:
     gr.Markdown("# PhoneDriver API")
     gr.Markdown("Mobile automation using cloud vision models")
-    
+
     with gr.Row():
         with gr.Column():
             gr.Markdown("### Configuration")
-            
+
             provider = gr.Dropdown(
                 choices=['kimi_code', 'openrouter', 'openai', 'moonshot'],
                 value='kimi_code',
                 label="Provider"
             )
-            
+
             api_key = gr.Textbox(
                 label="API Key",
                 type="password",
                 placeholder="Enter your API key"
             )
-            
+
             model = gr.Textbox(
                 label="Model",
                 value="kimi-for-coding",
                 placeholder="e.g., kimi-for-coding, gpt-4o"
             )
-            
+
             temperature = gr.Slider(
                 minimum=0.0,
                 maximum=1.0,
@@ -97,7 +108,7 @@ with gr.Blocks(title="PhoneDriver API") as demo:
                 step=0.1,
                 label="Temperature"
             )
-            
+
             max_tokens = gr.Slider(
                 minimum=256,
                 maximum=2048,
@@ -105,41 +116,57 @@ with gr.Blocks(title="PhoneDriver API") as demo:
                 step=64,
                 label="Max Tokens"
             )
-        
+
+            max_cycles = gr.Slider(
+                minimum=1,
+                maximum=50,
+                value=15,
+                step=1,
+                label="Max Cycles"
+            )
+
+            step_delay = gr.Slider(
+                minimum=0.5,
+                maximum=10.0,
+                value=1.5,
+                step=0.5,
+                label="Step Delay (seconds)"
+            )
+
         with gr.Column():
             gr.Markdown("### Task Execution")
-            
+
             task = gr.Textbox(
                 label="Task",
                 placeholder="e.g., Open Settings, Search for...",
                 lines=3
             )
-            
+
             run_btn = gr.Button("Run Task", variant="primary")
-            
+
             output = gr.Textbox(
                 label="Output",
                 lines=10,
                 interactive=False
             )
-    
+
     gr.Markdown("""
     ### Quick Start
     1. Select your provider
     2. Enter your API key
     3. Describe the task
     4. Click "Run Task"
-    
+
     ### Provider Setup
     - **Kimi Code**: Get key from https://kimi.com/code/console
     - **OpenRouter**: Get key from https://openrouter.ai
     - **OpenAI**: Get key from https://platform.openai.com
     - **Moonshot**: Get key from https://platform.moonshot.cn
     """)
-    
+
     run_btn.click(
         fn=run_task,
-        inputs=[task, provider, api_key, model, temperature, max_tokens],
+        inputs=[task, provider, api_key, model, temperature, max_tokens, max_cycles, step_delay],
         outputs=output
     )
 

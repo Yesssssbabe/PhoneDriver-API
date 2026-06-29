@@ -1,0 +1,11 @@
+{
+  "screen_width": 1080,
+  "screen_height": 2340,
+  "screenshot_dir": "./screenshots",
+  "max_cycles": 15,
+  "step_delay": 1.5,
+  "max_retries": 3,
+  "temperature": 0.1,
+  "max_tokens": 512,
+  "auto_detect_resolution": true
+}

@@ -127,13 +127,23 @@ python ui.py
 # Navigate to http://localhost:7860
 ```
 
+### Configuration
+
+Copy the example config file:
+```bash
+cp config.example.json config.json
+```
+
+Edit `config.json` to match your device and preferences. Screen resolution is auto-detected by default.
+
 ## 📁 Project Structure
 
 ```
 PhoneDriver-API/
 ├── phone_agent.py          # Main CLI agent
 ├── ui.py                   # Gradio web interface
-├── config.json             # Device configuration
+├── config.example.json     # Example device configuration
+├── config.json             # Device configuration (created by user)
 ├── .env                    # API keys (create from .env.example)
 ├── requirements.txt        # Python dependencies
 ├── README.md              # This file
@@ -174,12 +184,21 @@ adb shell wm size
 
 | Variable | Description | Required |
 |----------|-------------|----------|
+| Variable | Description | Required |
+|----------|-------------|----------|
 | `PROVIDER` | API provider (`kimi_code`, `openrouter`, `openai`, `moonshot`) | Yes |
 | `KIMI_CODE_API_KEY` | Kimi Code API key | If using Kimi Code |
 | `OPENROUTER_API_KEY` | OpenRouter API key | If using OpenRouter |
 | `OPENAI_API_KEY` | OpenAI API key | If using OpenAI |
 | `MOONSHOT_API_KEY` | Moonshot API key | If using Moonshot |
 | `MODEL` | Model name (provider-specific) | Optional |
+| `TEMPERATURE` | Sampling temperature (0.0–1.0) | Optional |
+| `MAX_TOKENS` | Max tokens per API response | Optional |
+| `MAX_RETRIES` | API retry attempts | Optional |
+| `MAX_CYCLES` | Max agent cycles per task | Optional |
+| `STEP_DELAY` | Delay between actions (seconds) | Optional |
+| `AUTO_DETECT_RESOLUTION` | Auto-detect screen size via ADB | Optional |
+| `CHECK_COMPLETION` | Enable task completion checks | Optional |
 
 ## 📝 Usage Examples
 
@@ -303,6 +322,15 @@ Contributions are welcome! Please feel free to submit a Pull Request.
 - [ ] Task recording and replay
 - [ ] iOS support (via WebDriverAgent)
 - [ ] Multi-device coordination
+
+## 🐛 Recent Improvements
+
+- Added `config.example.json` and automatic screen resolution detection
+- Refactored provider code to reduce duplication and add API retry logic
+- Fixed text input escaping using `shlex.quote` with a clipboard fallback
+- Fixed PNG screenshot saving (`optimize=True` instead of unsupported `quality`)
+- Added task completion checks and bounded action history
+- Improved device detection in `adb devices` parsing
 
 ---
 
