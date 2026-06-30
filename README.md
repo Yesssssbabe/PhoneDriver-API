@@ -7,7 +7,32 @@ A Python-based mobile automation agent that uses **Cloud Vision-Language APIs** 
 
 **No GPU required!** This fork replaces the original local Qwen3-VL model with API-based vision models.
 
+> ⚠️ **Security & Privacy Notice**
+> - **USB debugging** exposes your device to ADB-based attacks. Only enable it when actively using PhoneDriver-API, disable it immediately after use, and NEVER connect to untrusted computers or public charging stations while it is enabled.
+> - **Screenshots of your device are sent to cloud AI providers.** Do NOT use this tool while sensitive personal, financial, or confidential information is visible on screen. Review your provider's data retention policy before use.
+
 English | [简体中文](./README_CN.md) | [繁體中文](./README_TW.md) | [日本語](./README_JP.md) | [한국어](./README_KR.md) | [Español](./README_ES.md)
+
+## 🎯 Project Overview
+
+PhoneDriver-API is a cloud-powered mobile automation agent that turns natural-language instructions into ADB actions on Android devices. By pairing screenshots from your phone with a Vision-Language Model (VLM), it plans, executes, and verifies UI interactions without requiring a local GPU. This makes it easy to automate apps, settings, and workflows using only an API key and a USB-debugged device.
+
+```mermaid
+flowchart LR
+    User([User Task]) --> PhoneAgent
+    subgraph PhoneAgent["PhoneAgent"]
+        ConfigResolver[ConfigResolver]
+        TaskOrchestrator[TaskOrchestrator]
+        ActionExecutor[ActionExecutor]
+    end
+    PhoneAgent --> VLM[Vision-Language Provider]
+    VLM --> ADB[ADB]
+    ADB --> Android[Android Device]
+    Android --> Screenshot[Screenshot]
+    Screenshot --> PhoneAgent
+```
+
+The diagram above shows how a user task flows through PhoneAgent's internal components to the Vision-Language Provider, which reasons over a device screenshot and returns an ADB action. ADB executes the action on the Android device, and the resulting screenshot is fed back to the agent for the next step.
 
 ## 🌟 Features
 
@@ -49,7 +74,7 @@ brew install android-platform-tools
 ### 2. Clone & Install
 
 ```bash
-git clone https://github.com/yourusername/PhoneDriver-API.git
+git clone https://github.com/Yesssssbabe/PhoneDriver-API.git
 cd PhoneDriver-API
 
 # Create virtual environment
@@ -72,6 +97,8 @@ Copy the example config and edit:
 ```bash
 cp .env.example .env
 ```
+
+> **IMPORTANT:** Ensure `.env` is in your `.gitignore` file and NEVER commit API keys to version control. Keep your `.env` file secure and private.
 
 Edit `.env` with your preferred provider:
 
@@ -253,10 +280,11 @@ adb devices
 
 ### Wrong tap locations
 
-Auto-detect resolution in UI Settings tab, or manually verify:
+Resolution is auto-detected by default in both CLI and UI. If taps are incorrect, verify with:
 ```bash
 adb shell wm size
 ```
+Then manually set `screen_width` and `screen_height` in `config.json`.
 
 ### API errors
 

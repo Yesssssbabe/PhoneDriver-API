@@ -116,8 +116,12 @@ def test_add_new_provider_without_editing_init():
 
 
 def _make_fake_screenshot() -> str:
-    """Create a temporary file to satisfy _encode_image."""
-    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
+    """Create a temporary file inside the allowed screenshot directory."""
+    screenshot_dir = Path("./screenshots")
+    screenshot_dir.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(
+        dir=str(screenshot_dir), suffix=".png", delete=False
+    ) as f:
         f.write(b"\x89PNG\r\n\x1a\n")
         return f.name
 

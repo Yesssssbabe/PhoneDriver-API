@@ -7,7 +7,39 @@
 
 **GPU가 필요 없습니다!** 이 포크는 원래의 로컬 Qwen3-VL 모델을 API 기반 비전 모델로 대체합니다.
 
+> ⚠️ **보안 및 개인정보 보호 알림**
+> - **USB 디버깅**은 기기를 ADB 기반 공격에 노출시킵니다. PhoneDriver-API를 actively 사용하는 동안에만 활성화하고, 사용 후 즉시 비활성화하세요. 활성화된 상태에서는 신뢰할 수 없는 컴퓨터나 공공 충전소에 연결하지 마세요.
+> - **기기의 스크린샷이 클라우드 AI 공급자에게 전송됩니다.** 화면에 민감한 개인, 금융 또는 기밀 정보가 표시되어 있을 때는 이 도구를 사용하지 마세요. 사용 전 공급자의 데이터 보존 정책을 검토하세요.
+
 [English](./README.md) | [简体中文](./README_CN.md) | [繁體中文](./README_TW.md) | [日本語](./README_JP.md) | 한국어 | [Español](./README_ES.md)
+
+## 🎯 프로젝트 개요
+
+PhoneDriver-API는 자연어로 설명된 작업을 받아 Vision-Language 모델의 시각적 분석과 ADB 명령을 결합하여 Android 기기를 자율적으로 제어하는 Python 기반 모바일 에이전트입니다. 별도의 GPU 없이도 클라우드 VLM API를 활용해 스마트폰 화면을 읽고, 적절한 동작을 결정하며, 실제 기기에서 실행합니다. 이를 통해 복잡한 모바일 워크플로우를 몇 문장의 지시만으로 자동화할 수 있습니다.
+
+### 아키텍처 개요
+
+아래 다이어그램은 PhoneDriver-API의 전체 흐름을 보여줍니다. 노드 레이블은 기술 용어를 그대로 사용하고, 각 구성 요소에 대한 한국어 설명은 하단에 추가했습니다.
+
+```mermaid
+flowchart LR
+    User([User Task]) --> PA
+    subgraph PA [PhoneAgent]
+        ConfigResolver[ConfigResolver]
+        ActionExecutor[ActionExecutor]
+        TaskOrchestrator[TaskOrchestrator]
+    end
+    PA --> VLM[Vision-Language Provider]
+    VLM --> ADB[ADB]
+    ADB --> Android[Android Device]
+    Android -->|Screenshot| PA
+```
+
+- **User Task**: 사용자가 자연어로 입력한 작업입니다.
+- **PhoneAgent**: 설정 해석(ConfigResolver), 동작 실행(ActionExecutor), 작업 조율(TaskOrchestrator)로 구성된 핵심 에이전트입니다.
+- **Vision-Language Provider**: Kimi, GPT-4V, Claude 등의 클라우드 VLM API입니다.
+- **ADB**: Android Debug Bridge를 통해 기기에 명령을 전달합니다.
+- **Android Device**: 실제 제어되는 Android 기기이며, 캡처된 스크린샷이 PhoneAgent로 피드백되어 다음 동작을 결정합니다.
 
 ## 🌟 기능
 
@@ -49,7 +81,7 @@ brew install android-platform-tools
 ### 2. 클론 및 설치
 
 ```bash
-git clone https://github.com/yourusername/PhoneDriver-API.git
+git clone https://github.com/Yesssssbabe/PhoneDriver-API.git
 cd PhoneDriver-API
 
 # 가상 환경 생성
@@ -73,6 +105,8 @@ pip install -r requirements.txt
 cp .env.example .env
 cp config.example.json config.json
 ```
+
+> **중요:** `.env`가 `.gitignore`에 포함되어 있는지 확인하고 API 키를 버전 관리에 절대 커밋하지 마세요. `.env` 파일은 안전하게 보관하세요.
 
 선호하는 공급자로 `.env`를 편집:
 
@@ -240,10 +274,11 @@ adb devices
 
 ### 탭 위치가 잘못됨
 
-UI 설정 탭에서 해상도 자동 감지 또는 수동 확인:
+CLI와 UI 모두에서 해상도는 기본적으로 자동 감지됩니다. 탭 위치가 올바르지 않은 경우 다음 명령으로 확인하세요:
 ```bash
 adb shell wm size
 ```
+그런 다음 `config.json`에서 `screen_width`와 `screen_height`를 수동으로 설정하세요.
 
 ### API 오류
 

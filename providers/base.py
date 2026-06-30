@@ -9,11 +9,18 @@ from __future__ import annotations
 import base64
 import json
 import logging
+import os
 import re
 from abc import ABC, abstractmethod
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from .http_client import HttpClient, OpenAICompatibleClient
+
+
+MAX_RESPONSE_LENGTH = 100000  # 100 KB
+MAX_TASK_LENGTH = 2000
+MAX_IMAGE_SIZE = 10 * 1024 * 1024  # 10 MB
 
 
 class BaseProvider(ABC):
@@ -40,6 +47,9 @@ class BaseProvider(ABC):
     ) -> Dict[str, Any]:
         """Check whether the task appears to be complete."""
         ...
+
+    def close(self) -> None:
+        """Release resources held by the provider. Subclasses may override."""
 
 
 class OpenAICompatibleProvider(BaseProvider):
@@ -93,6 +103,15 @@ class OpenAICompatibleProvider(BaseProvider):
                 headers=headers or {},
             )
 
+        # Simple file-hash keyed cache for encoded screenshots
+        self._image_cache: Dict[str, str] = {}
+        self._max_cache_size = 8
+
+    def close(self) -> None:
+        """Close the underlying HTTP client if it supports close()."""
+        if hasattr(self._client, 'close'):
+            self._client.close()
+
     def _get_system_prompt(self) -> str:
         """Return the system prompt. Subclasses may override for customization."""
         return self.DEFAULT_SYSTEM_PROMPT
@@ -105,15 +124,52 @@ class OpenAICompatibleProvider(BaseProvider):
         history: List[str] = []
         previous_actions = context.get("previous_actions", [])
         for i, act in enumerate(previous_actions[-5:], 1):
+            act = dict(act)
             action_type = act.get("action", "unknown")
             element = act.get("elementName", "")
+            # Redact sensitive typed text from history sent to cloud providers
+            if action_type == "type" and "text" in act:
+                act["text"] = "[REDACTED]"
+                element = f"[REDACTED] {element}".strip()
             history.append(f"Step {i}: {action_type} {element}".strip())
         return "; ".join(history) if history else "No previous actions"
 
     def _encode_image(self, image_path: str) -> str:
-        """Encode image to base64."""
-        with open(image_path, "rb") as f:
-            return base64.b64encode(f.read()).decode("utf-8")
+        """Encode image to base64 with path validation."""
+        target = Path(image_path).resolve()
+        allowed_base = Path("./screenshots").resolve().parent
+        try:
+            target.relative_to(allowed_base)
+        except ValueError as exc:
+            raise ValueError(f"Invalid image path: {image_path}") from exc
+        if target.suffix.lower() != ".png":
+            raise ValueError(f"Invalid image extension: {image_path}")
+        if not target.exists():
+            raise FileNotFoundError(f"Image not found: {image_path}")
+        if not target.is_file():
+            raise ValueError(f"Image path is not a file: {image_path}")
+
+        size = os.path.getsize(target)
+        if size > MAX_IMAGE_SIZE:
+            raise ValueError(f"Image too large: {size} bytes (max {MAX_IMAGE_SIZE})")
+
+        # Cache keyed by path + mtime to avoid re-reading unchanged screenshots
+        mtime = os.path.getmtime(target)
+        cache_key = f"{target}:{mtime}"
+        if cache_key in self._image_cache:
+            return self._image_cache[cache_key]
+
+        with open(target, "rb") as f:
+            data = f.read()
+        try:
+            encoded = base64.b64encode(data).decode("utf-8")
+        finally:
+            del data
+
+        self._image_cache[cache_key] = encoded
+        if len(self._image_cache) > self._max_cache_size:
+            self._image_cache.pop(next(iter(self._image_cache)))
+        return encoded
 
     def _call_api(
         self,
@@ -128,7 +184,7 @@ class OpenAICompatibleProvider(BaseProvider):
 
         try:
             base64_image = self._encode_image(screenshot_path)
-        except (OSError, IOError) as exc:
+        except (OSError, IOError, ValueError) as exc:
             logging.error("Failed to read/encode screenshot %s: %s", screenshot_path, exc)
             return None
 
@@ -146,28 +202,49 @@ class OpenAICompatibleProvider(BaseProvider):
             ],
         })
 
-        content = self._client.chat_completion(
-            messages,
-            model=self.model,
-            temperature=self.temperature,
-            max_tokens=max_tokens,
-            max_retries=self.max_retries,
-        )
-        if content is None:
+        try:
+            content = self._client.chat_completion(
+                messages,
+                model=self.model,
+                temperature=self.temperature,
+                max_tokens=max_tokens,
+                max_retries=self.max_retries,
+            )
+            if content is None:
+                return None
+            return self._parse_response(content)
+        finally:
+            del base64_image
+
+    @staticmethod
+    def _extract_json(content: str) -> Optional[str]:
+        """Extract the outermost JSON object from content using bracket balancing."""
+        start = content.find('{')
+        if start == -1:
             return None
-        return self._parse_response(content)
+        depth = 0
+        for i, ch in enumerate(content[start:], start):
+            if ch == '{':
+                depth += 1
+            elif ch == '}':
+                depth -= 1
+                if depth == 0:
+                    return content[start:i + 1]
+        return None
 
     def _parse_response(self, content: str) -> Optional[Dict[str, Any]]:
         """Parse API response into an action dict."""
+        if len(content) > MAX_RESPONSE_LENGTH:
+            logging.error("Response too large: %d bytes", len(content))
+            return None
         try:
+            # Prefer markdown fence content if present
             json_match = re.search(r"```json\s*(\{.*?\})\s*```", content, re.DOTALL)
             if json_match:
                 json_str = json_match.group(1)
             else:
-                json_match = re.search(r"\{[\s\S]*?\"action\"[\s\S]*?\}", content)
-                if json_match:
-                    json_str = json_match.group(0)
-                else:
+                json_str = self._extract_json(content)
+                if json_str is None:
                     json_str = content.strip()
 
             data = json.loads(json_str)
@@ -177,27 +254,54 @@ class OpenAICompatibleProvider(BaseProvider):
             logging.debug("Content: %s", content)
             return None
 
-    def _normalize_action(self, data: Dict[str, Any]) -> Dict[str, Any]:
+    def _normalize_action(self, data: Any) -> Dict[str, Any]:
         """Normalize action to internal format."""
+        if not isinstance(data, dict):
+            logging.error("Expected dict from JSON, got %s", type(data).__name__)
+            return {"action": "wait"}
+
         action_type = data.get("action", "wait")
+        allowed_actions = {"click", "swipe", "type", "wait", "terminate", "tap"}
+        if action_type not in allowed_actions:
+            logging.warning("Unknown action type: %s", action_type)
+            action_type = "wait"
+
         action: Dict[str, Any] = {
             "action": action_type,
-            "reasoning": data.get("thought", data.get("reasoning", "")),
+            "reasoning": str(data.get("thought", data.get("reasoning", "")))[:500],
         }
 
         # Handle coordinates
-        if "coordinate" in data:
-            coord = data["coordinate"]
-            action["coordinates"] = [coord[0] / 999.0, coord[1] / 999.0]
+        coord = data.get("coordinate")
+        if isinstance(coord, (list, tuple)) and len(coord) >= 2:
+            try:
+                x, y = float(coord[0]), float(coord[1])
+                if 0.0 <= x <= 999.0 and 0.0 <= y <= 999.0:
+                    action["coordinates"] = [x / 999.0, y / 999.0]
+                else:
+                    logging.warning("Coordinate out of range: %s", coord)
+            except (TypeError, ValueError):
+                logging.warning("Non-numeric coordinate values: %s", coord)
+        elif coord is not None:
+            logging.warning("Invalid coordinate format: %s", coord)
 
-        if "coordinate2" in data:
-            coord2 = data["coordinate2"]
-            action["coordinate2"] = [coord2[0] / 999.0, coord2[1] / 999.0]
+        coord2 = data.get("coordinate2")
+        if isinstance(coord2, (list, tuple)) and len(coord2) >= 2:
+            try:
+                x2, y2 = float(coord2[0]), float(coord2[1])
+                if 0.0 <= x2 <= 999.0 and 0.0 <= y2 <= 999.0:
+                    action["coordinate2"] = [x2 / 999.0, y2 / 999.0]
+                else:
+                    logging.warning("Coordinate2 out of range: %s", coord2)
+            except (TypeError, ValueError):
+                logging.warning("Non-numeric coordinate2 values: %s", coord2)
+        elif coord2 is not None:
+            logging.warning("Invalid coordinate2 format: %s", coord2)
 
         # Map action types
         if action_type == "click":
             action["action"] = "tap"
-        elif action_type == "swipe" and "coordinate2" in action:
+        elif action_type == "swipe" and "coordinates" in action and "coordinate2" in action:
             start = action["coordinates"]
             end = action["coordinate2"]
             dx, dy = end[0] - start[0], end[1] - start[1]
@@ -208,10 +312,11 @@ class OpenAICompatibleProvider(BaseProvider):
                 "left"
             )
         elif action_type == "type":
-            action["text"] = data.get("text", "")
+            text = data.get("text", "")
+            action["text"] = str(text) if text is not None else ""
         elif action_type == "terminate":
             action["status"] = data.get("status", "success")
-            action["message"] = data.get("thought", "Task ended")
+            action["message"] = str(data.get("thought", "Task ended"))[:500]
 
         return action
 
@@ -222,9 +327,14 @@ class OpenAICompatibleProvider(BaseProvider):
         context: Optional[Dict[str, Any]] = None,
     ) -> Optional[Dict[str, Any]]:
         """Analyze screenshot and return action."""
+        if len(user_request) > MAX_TASK_LENGTH:
+            logging.error("Task too long: %d (max %d)", len(user_request), MAX_TASK_LENGTH)
+            raise ValueError(f"Task exceeds maximum length of {MAX_TASK_LENGTH}")
+
         history = self._build_history(context)
+        safe_task = user_request.replace('\n', ' ').replace('\r', '')
         prompt = (
-            f"Task: {user_request}\nHistory: {history}\n\n"
+            f"Task: {safe_task}\nHistory: {history}\n\n"
             "Analyze screenshot and decide next action."
         )
         return self._call_api(screenshot_path, prompt)
@@ -251,23 +361,18 @@ class OpenAICompatibleProvider(BaseProvider):
                 max_tokens=256,
             )
 
-            if result and isinstance(result, dict) and "completed" in result:
-                completed = result["completed"]
+            if result and isinstance(result, dict):
+                completed = result.get("completed", False)
                 if isinstance(completed, str):
                     completed = completed.lower() == "true"
                 return {
                     "complete": bool(completed),
-                    "reason": result.get("reason", ""),
+                    "reason": str(result.get("reason", "")),
                     "confidence": 0.9 if completed else 0.7,
                 }
 
-            content = result.get("reasoning", "") if isinstance(result, dict) else ""
-            return {
-                "complete": "true" in content.lower(),
-                "reason": content[:200],
-                "confidence": 0.5,
-            }
+            return {"complete": False, "reason": "", "confidence": 0.0}
 
-        except Exception as exc:
+        except (OSError, ValueError, AttributeError) as exc:
             logging.error("Error checking completion: %s", exc)
-            return {"complete": False, "reason": str(exc), "confidence": 0.0}
+            return {"complete": False, "reason": "Completion check failed", "confidence": 0.0}

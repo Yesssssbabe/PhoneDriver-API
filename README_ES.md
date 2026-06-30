@@ -7,7 +7,32 @@ Un agente de automatización móvil basado en Python que utiliza **APIs de Visi�
 
 **¡No se requiere GPU!** Este fork reemplaza el modelo local Qwen3-VL original por modelos de visión basados en API.
 
+> ⚠️ **Aviso de seguridad y privacidad**
+> - La **depuración USB** expone tu dispositivo a ataques basados en ADB. Habilítala solo mientras uses PhoneDriver-API, deshabilítala inmediatamente después y NUNCA la conectes a computadoras no confiables o estaciones de carga públicas mientras esté habilitada.
+> - **Las capturas de pantalla de tu dispositivo se envían a proveedores de IA en la nube.** NO uses esta herramienta mientras haya información personal, financiera o confidencial visible en la pantalla. Revisa la política de retención de datos de tu proveedor antes de usarla.
+
 [English](./README.md) | [简体中文](./README_CN.md) | [繁體中文](./README_TW.md) | [日本語](./README_JP.md) | [한국어](./README_KR.md) | Español
+
+## 🧩 Visión general del proyecto
+
+PhoneDriver-API es un agente de automatización móvil que permite controlar dispositivos Android mediante instrucciones en lenguaje natural. El sistema combina modelos de visión-lenguaje en la nube con comandos ADB para comprender la interfaz de la pantalla, planificar acciones y ejecutarlas de forma autónoma. Su valor principal es eliminar la necesidad de GPU local y ofrecer una solución accesible, flexible y multi-proveedor para la interacción automatizada con smartphones.
+
+```mermaid
+flowchart LR
+    A[Tarea del usuario] --> B[PhoneAgent]
+    subgraph PhoneAgent [PhoneAgent]
+        B1[ConfigResolver]
+        B2[TaskOrchestrator]
+        B3[ActionExecutor]
+    end
+    B --> C[Vision-Language Provider]
+    C --> D[ADB]
+    D --> E[Dispositivo Android]
+    E --> F[Captura de pantalla]
+    F --> C
+```
+
+En el diagrama anterior, la **Tarea del usuario** entra en el **PhoneAgent**, donde los módulos internos (`ConfigResolver`, `TaskOrchestrator` y `ActionExecutor`) coordinan la ejecución. El agente consulta un **Vision-Language Provider** (Kimi, GPT-4V, Claude, etc.) enviando capturas de pantalla del dispositivo; este proveedor devuelve la acción a ejecutar, que se traduce en comandos **ADB** y se aplica al **Dispositivo Android**. La nueva captura de pantalla se reinyecta al proveedor como retroalimentación visual, cerrando el bucle de percepción-acción.
 
 ## 🌟 Características
 
@@ -49,7 +74,7 @@ brew install android-platform-tools
 ### 2. Clonar e instalar
 
 ```bash
-git clone https://github.com/yourusername/PhoneDriver-API.git
+git clone https://github.com/Yesssssbabe/PhoneDriver-API.git
 cd PhoneDriver-API
 
 # Crear entorno virtual
@@ -73,6 +98,8 @@ Copiar la configuración de ejemplo y editar:
 cp .env.example .env
 cp config.example.json config.json
 ```
+
+> **IMPORTANTE:** Asegúrate de que `.env` esté en tu `.gitignore` y NUNCA confirms las claves API en el control de versiones. Mantén tu archivo `.env` seguro y privado.
 
 Edita `.env` con tu proveedor preferido:
 
@@ -241,10 +268,11 @@ adb devices
 
 ### Ubicaciones de toque incorrectas
 
-Detecta la resolución automáticamente en la pestaña Configuración de la UI, o verifica manualmente:
+La resolución se detecta automáticamente de forma predeterminada tanto en CLI como en UI. Si los toques son incorrectos, verifica con:
 ```bash
 adb shell wm size
 ```
+Luego configura manualmente `screen_width` y `screen_height` en `config.json`.
 
 ### Errores de API
 

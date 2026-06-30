@@ -11,11 +11,57 @@ from __future__ import annotations
 import json
 import logging
 import random
+import threading
 import time
 from abc import ABC, abstractmethod
+from enum import Enum, auto
 from typing import Any, Dict, List, Optional
 
 import requests
+
+
+class CircuitState(Enum):
+    CLOSED = auto()
+    OPEN = auto()
+    HALF_OPEN = auto()
+
+
+class CircuitBreaker:
+    """Simple circuit breaker to fail fast during sustained API outages."""
+
+    def __init__(self, failure_threshold: int = 5, recovery_timeout: float = 30.0):
+        self.failure_threshold = failure_threshold
+        self.recovery_timeout = recovery_timeout
+        self.failures = 0
+        self.last_failure_time = 0.0
+        self.state = CircuitState.CLOSED
+        self._lock = threading.Lock()
+
+    def record_success(self) -> None:
+        with self._lock:
+            self.failures = 0
+            self.state = CircuitState.CLOSED
+
+    def record_failure(self) -> bool:
+        """Record a failure. Returns True if the breaker just opened."""
+        with self._lock:
+            self.failures += 1
+            self.last_failure_time = time.time()
+            if self.failures >= self.failure_threshold:
+                self.state = CircuitState.OPEN
+                return True
+            return False
+
+    def can_execute(self) -> bool:
+        with self._lock:
+            if self.state == CircuitState.CLOSED:
+                return True
+            if self.state == CircuitState.OPEN:
+                if time.time() - self.last_failure_time > self.recovery_timeout:
+                    self.state = CircuitState.HALF_OPEN
+                    return True
+                return False
+            return True  # HALF_OPEN allows one probe
 
 
 class HttpClient(ABC):
@@ -38,6 +84,9 @@ class HttpClient(ABC):
         """
         ...
 
+    def close(self) -> None:
+        """Release resources. Subclasses may override."""
+
 
 class OpenAICompatibleClient(HttpClient):
     """HTTP client for OpenAI-compatible ``/chat/completions`` endpoints."""
@@ -51,6 +100,13 @@ class OpenAICompatibleClient(HttpClient):
         self.base_url = base_url.rstrip("/")
         self.headers = headers or {}
         self.session = session or requests.Session()
+        self.session.verify = True
+        self.circuit_breaker = CircuitBreaker()
+
+    def close(self) -> None:
+        """Close the requests session and release connections."""
+        if self.session is not None:
+            self.session.close()
 
     def chat_completion(
         self,
@@ -63,6 +119,10 @@ class OpenAICompatibleClient(HttpClient):
         timeout: float = 60.0,
     ) -> Optional[str]:
         """Call ``/chat/completions`` with retry, backoff and safe parsing."""
+        if not self.circuit_breaker.can_execute():
+            logging.error("Circuit breaker OPEN - request rejected")
+            return None
+
         payload = {
             "model": model,
             "messages": messages,
@@ -89,28 +149,32 @@ class OpenAICompatibleClient(HttpClient):
                         max_retries,
                         retry_after,
                     )
-                    time.sleep(retry_after)
-                    continue
+                    if attempt < max_retries:
+                        time.sleep(retry_after)
+                        continue
+                    return None
 
                 # 4xx errors other than 429 are not worth retrying.
                 if 400 <= resp.status_code < 500 and resp.status_code != 429:
                     logging.error(
-                        "Non-retriable HTTP error %d: %s",
+                        "Non-retriable HTTP error %d from %s. Response body omitted for security.",
                         resp.status_code,
-                        resp.text[:500],
+                        url,
                     )
+                    self.circuit_breaker.record_failure()
                     return None
 
                 resp.raise_for_status()
                 data = resp.json()
                 choices = data.get("choices", [])
-                if not choices:
-                    logging.error("Empty choices in API response")
+                if not isinstance(choices, list) or not choices:
+                    logging.error("Invalid or empty choices in API response")
                     return None
                 content = choices[0].get("message", {}).get("content")
                 if content is None:
                     logging.error("Missing content in API response")
                     return None
+                self.circuit_breaker.record_success()
                 return content
 
             except requests.exceptions.Timeout as exc:
@@ -118,6 +182,8 @@ class OpenAICompatibleClient(HttpClient):
                 logging.warning(
                     "API timeout on attempt %d/%d: %s", attempt, max_retries, exc
                 )
+                if self.circuit_breaker.record_failure():
+                    break
             except (requests.exceptions.ConnectionError, requests.exceptions.SSLError) as exc:
                 last_error = exc
                 logging.warning(
@@ -126,6 +192,8 @@ class OpenAICompatibleClient(HttpClient):
                     max_retries,
                     exc,
                 )
+                if self.circuit_breaker.record_failure():
+                    break
             except requests.exceptions.RequestException as exc:
                 last_error = exc
                 logging.warning(
@@ -134,6 +202,8 @@ class OpenAICompatibleClient(HttpClient):
                     max_retries,
                     exc,
                 )
+                if self.circuit_breaker.record_failure():
+                    break
             except (json.JSONDecodeError, ValueError, AttributeError) as exc:
                 last_error = exc
                 logging.warning(
@@ -142,6 +212,8 @@ class OpenAICompatibleClient(HttpClient):
                     max_retries,
                     exc,
                 )
+                if self.circuit_breaker.record_failure():
+                    break
 
             if attempt < max_retries:
                 delay = min(2 ** attempt + random.uniform(0, 1), 60.0)

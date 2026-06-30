@@ -7,7 +7,30 @@
 
 **無需 GPU！** 此分支將原本的本地 Qwen3-VL 模型替換為基於 API 的視覺模型。
 
+> ⚠️ **安全與隱私提示**
+> - **USB 偵錯**會使裝置暴露於 ADB 攻擊。僅在 actively 使用 PhoneDriver-API 時啟用，使用完畢後立即關閉，且啟用期間切勿連接不可信的電腦或公共充電站。
+> - **裝置截圖會被傳送至雲端 AI 供應商。** 當螢幕上顯示敏感的個人、財務或機密資訊時，請勿使用本工具。使用前請查看供應商的資料保留政策。
+
 [English](./README.md) | [简体中文](./README_CN.md) | 繁體中文 | [日本語](./README_JP.md) | [한국어](./README_KR.md) | [Español](./README_ES.md)
+
+## 🎯 專案概述
+
+PhoneDriver-API 是一款基於 Python 的行動裝置自動化代理，透過整合雲端視覺-語言模型與 ADB 指令，讓使用者能以自然語言驅動 Android 裝置完成各種操作。其核心價值在於無需本地 GPU 即可運行，只需提供 API 金鑰，就能將大語言模型的視覺理解能力轉化為實際的裝置自動化執行力。
+
+### 運作流程圖
+
+```mermaid
+flowchart LR
+    A[User Task<br/>自然語言任務] --> B[PhoneAgent<br/>ConfigResolver / ActionExecutor / TaskOrchestrator]
+    B --> C[Vision-Language Provider<br/>雲端視覺-語言 API]
+    C --> B
+    B --> D[ADB<br/>Android Debug Bridge]
+    D --> E[Android Device<br/>Android 裝置]
+    E --> F[Screenshot<br/>螢幕截圖]
+    F --> B
+```
+
+圖中各節點英文標籤說明如下：`User Task` 為使用者輸入的自然語言任務；`PhoneAgent` 負責解析設定、執行動作與協調任務；`Vision-Language Provider` 為提供視覺理解能力的雲端 API；`ADB` 透過 Android Debug Bridge 與裝置通訊；`Screenshot` 則作為視覺回饋，讓代理能持續觀察並調整下一步動作。
 
 ## 🌟 功能特色
 
@@ -49,7 +72,7 @@ brew install android-platform-tools
 ### 2. 複製並安裝
 
 ```bash
-git clone https://github.com/yourusername/PhoneDriver-API.git
+git clone https://github.com/Yesssssbabe/PhoneDriver-API.git
 cd PhoneDriver-API
 
 # 建立虛擬環境
@@ -73,6 +96,8 @@ pip install -r requirements.txt
 cp .env.example .env
 cp config.example.json config.json
 ```
+
+> **重要：** 請確保 `.env` 已加入 `.gitignore`，切勿將 API 金鑰提交到版本控制。請妥善保管 `.env` 檔案。
 
 編輯 `.env` 檔案，選擇你偏好的供應商：
 
@@ -241,10 +266,11 @@ adb devices
 
 ### 點擊位置錯誤
 
-在 UI 設定分頁中自動偵測解析度，或手動驗證：
+CLI 和 UI 預設都會自動偵測解析度。如果點擊位置不正確，請透過以下命令驗證：
 ```bash
 adb shell wm size
 ```
+然後在 `config.json` 中手動設定 `screen_width` 和 `screen_height`。
 
 ### API 錯誤
 

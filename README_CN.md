@@ -7,7 +7,33 @@
 
 **无需 GPU！** 本项目将原始的本地 Qwen3-VL 模型替换为基于 API 的视觉模型。
 
+> ⚠️ **安全与隐私提示**
+> - **USB 调试**会使设备暴露于基于 ADB 的攻击。仅在 actively 使用 PhoneDriver-API 时启用，使用完毕后立即关闭，且启用期间切勿连接不可信的电脑或公共充电站。
+> - **设备截图会被发送至云端 AI 提供商。** 当屏幕上显示敏感的个人、财务或机密信息时，请勿使用本工具。使用前请查看提供商的数据保留政策。
+
 [English](./README.md) | 简体中文 | [繁體中文](./README_TW.md) | [日本語](./README_JP.md) | [한국어](./README_KR.md) | [Español](./README_ES.md)
+
+## 📖 项目简介
+
+PhoneDriver-API 是一个基于 Python 的手机自动化框架，通过调用云端视觉-语言模型（VLM）理解屏幕截图并生成 ADB 指令，让用户只需用自然语言描述任务即可自动操控 Android 设备。它无需本地 GPU，只需配置 API 密钥即可快速实现“看图操作手机”的端到端自动化流程。
+
+### 整体架构
+
+```mermaid
+flowchart LR
+    User([User Task]) --> PhoneAgent[PhoneAgent]
+    subgraph PA [PhoneAgent]
+        ConfigResolver[ConfigResolver]
+        ActionExecutor[ActionExecutor]
+        TaskOrchestrator[TaskOrchestrator]
+    end
+    PhoneAgent --> VLM[Vision-Language Provider]
+    VLM --> ADB[ADB]
+    ADB --> Device[Android Device]
+    Device -->|Screenshot| PhoneAgent
+```
+
+上图展示了 PhoneDriver-API 的核心数据流：用户输入任务后，由 `PhoneAgent` 内部模块解析配置、规划并执行动作；代理调用云端视觉-语言模型分析当前屏幕截图，模型生成 ADB 命令，经 ADB 下发到 Android 设备执行；设备将新的截图回传给 `PhoneAgent`，形成“感知-决策-执行”闭环，直到任务完成。
 
 ## 🌟 特性
 
@@ -72,6 +98,8 @@ pip install -r requirements.txt
 ```bash
 cp .env.example .env
 ```
+
+> **重要：** 请确保 `.env` 已加入 `.gitignore`，切勿将 API 密钥提交到版本控制。请妥善保管 `.env` 文件。
 
 编辑 `.env` 文件，选择你喜欢的提供商：
 
@@ -250,10 +278,11 @@ adb devices
 
 ### 点击位置错误
 
-在 UI 的设置标签页中自动检测分辨率，或手动验证：
+CLI 和 UI 默认都会自动检测分辨率。如果点击位置不正确，请通过以下命令验证：
 ```bash
 adb shell wm size
 ```
+然后在 `config.json` 中手动设置 `screen_width` 和 `screen_height`。
 
 ### API 错误
 

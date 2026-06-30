@@ -7,7 +7,40 @@
 
 **GPU は不要です！** このフォークは、元のローカル Qwen3-VL モデルを API ベースのビジョンモデルに置き換えています。
 
+> ⚠️ **セキュリティとプライバシーに関する注意**
+> - **USB デバッグ**は、デバイスを ADB ベースの攻撃に晒します。PhoneDriver-API を使用している間のみ有効にし、使用後は直ちに無効にしてください。有効な間は、信頼できないコンピューターや公共の充電ステーションに接続しないでください。
+> - **デバイスのスクリーンショットはクラウド AI プロバイダーに送信されます。** 画面に機密性の高い個人情報、財務情報、または機密情報が表示されている場合は、このツールを使用しないでください。使用前にプロバイダーのデータ保持ポリシーを確認してください。
+
 [English](./README.md) | [简体中文](./README_CN.md) | [繁體中文](./README_TW.md) | 日本語 | [한국어](./README_KR.md) | [Español](./README_ES.md)
+
+## 📖 プロジェクト概要 / はじめに
+
+PhoneDriver-APIは、クラウドのVision-Language APIを活用し、自然言語で指定されたタスクをAndroidデバイス上で自動実行するモバイル自動化エージェントです。スクリーンショットの視覚解析とADBコマンドを組み合わせることで、ローカルGPUを必要とせずにスマートフォン操作を自動化できます。
+
+```mermaid
+flowchart LR
+    UserTask[User Task]
+    PhoneAgent[PhoneAgent]
+    ConfigResolver[ConfigResolver]
+    ActionExecutor[ActionExecutor]
+    TaskOrchestrator[TaskOrchestrator]
+    VLM[Vision-Language Provider]
+    ADB[ADB]
+    Device[Android Device]
+    Screenshot[Screenshot]
+
+    UserTask --> PhoneAgent
+    PhoneAgent --> ConfigResolver
+    PhoneAgent --> ActionExecutor
+    PhoneAgent --> TaskOrchestrator
+    PhoneAgent --> VLM
+    VLM --> ADB
+    ADB --> Device
+    Device -->|feedback| Screenshot
+    Screenshot --> PhoneAgent
+```
+
+上記の図は、ユーザーのタスクがPhoneAgentの各モジュールを経由してVision-Language Providerに渡され、ADBコマンドでAndroidデバイスを操作し、取得したスクリーンショットをフィードバックとして繰り返し処理するワークフローを示しています。英語のラベルはMermaid表記を簡潔にするために使用しています。
 
 ## 🌟 特徴
 
@@ -49,7 +82,7 @@ brew install android-platform-tools
 ### 2. クローンとインストール
 
 ```bash
-git clone https://github.com/yourusername/PhoneDriver-API.git
+git clone https://github.com/Yesssssbabe/PhoneDriver-API.git
 cd PhoneDriver-API
 
 # 仮想環境の作成
@@ -73,6 +106,8 @@ pip install -r requirements.txt
 cp .env.example .env
 cp config.example.json config.json
 ```
+
+> **重要：** `.env` が `.gitignore` に含まれていることを確認し、API キーをバージョン管理に決してコミットしないでください。`.env` ファイルは安全に保管してください。
 
 お好みのプロバイダーで `.env` を編集：
 
@@ -239,10 +274,11 @@ adb devices
 
 ### タップ位置がずれる
 
-UI の設定タブで解像度を自動検出するか、手動で確認：
+CLI と UI の両方で、解像度はデフォルトで自動検出されます。タップ位置が正しくない場合は、以下のコマンドで確認してください：
 ```bash
 adb shell wm size
 ```
+その後、`config.json` で `screen_width` と `screen_height` を手動で設定してください。
 
 ### API エラー
 

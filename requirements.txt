@@ -1,10 +1,10 @@
-# Core dependencies
-requests>=2.31.0
-Pillow>=10.0.0
-python-dotenv>=1.0.0
+# Core dependencies (pinned to known-good versions)
+requests==2.32.3
+Pillow==12.2.0
+python-dotenv==1.1.0
 
 # Web UI
-gradio>=4.0.0
+gradio==6.7.0
 
 # Optional: For local model fallback (not required for API mode)
 # torch>=2.0.0

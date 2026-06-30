@@ -54,34 +54,38 @@ PhoneDriver-API/
 To add support for a new API provider:
 
 1. Create a new file in `providers/` directory
-2. Inherit from `BaseProvider`
-3. Implement required methods:
+2. Inherit from `OpenAICompatibleProvider` (or `BaseProvider` for custom protocols)
+3. Add the `@register_provider("your_name")` decorator to the class
+4. Implement or override required methods if inheriting from `BaseProvider`:
    - `analyze_screenshot()`
    - `check_task_completion()`
-4. Add to `PROVIDER_MAP` in `providers/__init__.py`
 5. Update `.env.example` with new provider config
 6. Update README.md with documentation
+
+The `providers/__init__.py` auto-discovers provider modules at import time, so
+**no manual edits to `PROVIDER_MAP` are required**.
 
 Example:
 
 ```python
-from .base import BaseProvider
+from . import register_provider
+from .base import OpenAICompatibleProvider
 
-class MyProvider(BaseProvider):
+@register_provider("my_provider")
+class MyProvider(OpenAICompatibleProvider):
     default_model = "my-model"
-    
+
     def __init__(self, api_key: str, **kwargs):
-        super().__init__(api_key, **kwargs)
-        self.api_url = "https://api.example.com/v1"
-        self.headers = {"Authorization": f"Bearer {api_key}"}
-    
-    def analyze_screenshot(self, screenshot_path, user_request, context=None):
-        # Implementation
-        pass
-    
-    def check_task_completion(self, screenshot_path, user_request, context):
-        # Implementation
-        pass
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        }
+        super().__init__(
+            api_key=api_key,
+            base_url="https://api.example.com/v1",
+            headers=headers,
+            **kwargs,
+        )
 ```
 
 ## Code Style

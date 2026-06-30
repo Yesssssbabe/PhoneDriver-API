@@ -17,13 +17,31 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import logging
 import os
+import re
+import stat
+import subprocess
 import sys
 import time
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
+
+
+class SecureRotatingFileHandler(RotatingFileHandler):
+    """RotatingFileHandler that creates log files with restrictive permissions."""
+
+    def _open(self):
+        stream = super()._open()
+        if os.name != "nt":
+            try:
+                os.chmod(self.baseFilename, 0o600)
+            except OSError:
+                pass
+        return stream
 
 from dotenv import load_dotenv
 
@@ -31,9 +49,6 @@ from providers import get_provider
 from providers.base import BaseProvider
 from utils.adb import ADBClient
 from utils.screenshot import ScreenshotCapture
-
-# Load environment variables
-load_dotenv()
 
 
 # =============================================================================
@@ -49,6 +64,10 @@ DEFAULT_MAX_TOKENS: int = 512
 DEFAULT_MAX_RETRIES: int = 3
 DEFAULT_WAIT_TIME_MS: int = 1000
 
+MAX_WAIT_TIME_MS: int = 30000
+MIN_WAIT_TIME_MS: int = 0
+MAX_CONFIG_SIZE: int = 64 * 1024  # 64 KB
+
 API_KEY_ENV_MAP: Dict[str, str] = {
     "kimi_code": "KIMI_CODE_API_KEY",
     "openrouter": "OPENROUTER_API_KEY",
@@ -58,16 +77,67 @@ API_KEY_ENV_MAP: Dict[str, str] = {
 
 
 # =============================================================================
-# Logging
+# Logging scrubber
 # =============================================================================
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s",
-    handlers=[
-        logging.StreamHandler(sys.stdout),
-        logging.FileHandler("phone_agent.log", encoding="utf-8"),
-    ],
-)
+class APIScrubFilter(logging.Filter):
+    """Redact API keys and Bearer tokens from log records."""
+
+    _PATTERNS = [
+        (re.compile(r"(Bearer\s+)[a-zA-Z0-9_\-\.]+"), r"\1<REDACTED>"),
+        (re.compile(r"([_A-Z]*API_KEY\s*[:=]?\s*)[^\s'\"]+", re.IGNORECASE), r"\1<REDACTED>"),
+        (re.compile(r"(Authorization\s*[:=]?\s*)[^\s'\"]+", re.IGNORECASE), r"\1<REDACTED>"),
+    ]
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        msg = str(record.msg)
+        for pattern, repl in self._PATTERNS:
+            msg = pattern.sub(repl, msg)
+        record.msg = msg
+        if record.args:
+            record.args = tuple(
+                self._scrub_arg(arg) for arg in record.args
+            )
+        return True
+
+    @classmethod
+    def _scrub_arg(cls, arg: Any) -> str:
+        text = str(arg)
+        for pattern, repl in cls._PATTERNS:
+            text = pattern.sub(repl, text)
+        return text
+
+
+def _setup_logging() -> None:
+    """Configure logging with rotation and API key scrubbing."""
+    log_path = Path("phone_agent.log")
+    if not log_path.exists():
+        log_path.touch(mode=0o600)
+    elif os.name != "nt":
+        try:
+            os.chmod(log_path, 0o600)
+        except OSError:
+            pass
+
+    formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
+    scrubber = APIScrubFilter()
+
+    stream_handler = logging.StreamHandler(sys.stdout)
+    stream_handler.setFormatter(formatter)
+    stream_handler.addFilter(scrubber)
+
+    file_handler = SecureRotatingFileHandler(
+        log_path,
+        maxBytes=10 * 1024 * 1024,  # 10 MB
+        backupCount=5,
+        encoding="utf-8",
+    )
+    file_handler.setFormatter(formatter)
+    file_handler.addFilter(scrubber)
+
+    logging.basicConfig(
+        level=logging.INFO,
+        handlers=[stream_handler, file_handler],
+    )
 
 
 # =============================================================================
@@ -79,6 +149,10 @@ class UnrecoverableTaskError(Exception):
 
 class RecoverableTaskError(Exception):
     """Raised when a transient failure allows the task to retry next cycle."""
+
+
+class ActionValidationError(Exception):
+    """Raised when an action dict fails schema validation."""
 
 
 # =============================================================================
@@ -93,7 +167,7 @@ class ConfigResolver:
 
     def resolve(self) -> Dict[str, Any]:
         """Return a normalized configuration dict with safe defaults."""
-        cfg = dict(self.config)
+        cfg = copy.deepcopy(self.config)
 
         provider = self._resolve_provider(cfg)
         cfg["provider"] = provider
@@ -104,15 +178,24 @@ class ConfigResolver:
         model = self._resolve_model(cfg)
         cfg["model"] = model
 
-        cfg["temperature"] = self._float(cfg.get("temperature"), DEFAULT_TEMPERATURE)
-        cfg["max_tokens"] = max(1, self._int(cfg.get("max_tokens"), DEFAULT_MAX_TOKENS))
+        temperature = self._float(cfg.get("temperature"), DEFAULT_TEMPERATURE)
+        cfg["temperature"] = max(0.0, min(2.0, temperature))
+        cfg["max_tokens"] = max(1, min(4096, self._int(cfg.get("max_tokens"), DEFAULT_MAX_TOKENS)))
         cfg["max_retries"] = max(0, self._int(cfg.get("max_retries"), DEFAULT_MAX_RETRIES))
         cfg["max_cycles"] = max(1, self._int(cfg.get("max_cycles"), DEFAULT_MAX_CYCLES))
         cfg["step_delay"] = max(0.0, self._float(cfg.get("step_delay"), DEFAULT_STEP_DELAY))
         cfg["max_history"] = max(1, self._int(cfg.get("max_history"), DEFAULT_MAX_HISTORY))
         cfg["check_completion"] = bool(cfg.get("check_completion", True))
         cfg["auto_detect_resolution"] = bool(cfg.get("auto_detect_resolution", True))
-        cfg["screenshot_dir"] = cfg.get("screenshot_dir", "./screenshots")
+
+        screenshot_dir = cfg.get("screenshot_dir", "./screenshots")
+        screenshot_path = Path(screenshot_dir).resolve()
+        allowed_base = Path("./screenshots").resolve().parent
+        try:
+            screenshot_path.relative_to(allowed_base)
+        except ValueError as exc:
+            raise ValueError(f"Invalid screenshot_dir: {screenshot_dir}") from exc
+        cfg["screenshot_dir"] = str(screenshot_path)
 
         cfg.setdefault("screen_width", DEFAULT_SCREEN_WIDTH)
         cfg.setdefault("screen_height", DEFAULT_SCREEN_HEIGHT)
@@ -159,6 +242,59 @@ class ConfigResolver:
 
 
 # =============================================================================
+# Action validation
+# =============================================================================
+class ActionValidator:
+    """Validate action dicts before execution."""
+
+    ALLOWED_ACTIONS = {"tap", "swipe", "type", "wait", "terminate"}
+    ALLOWED_DIRECTIONS = {"down", "up", "left", "right"}
+
+    def validate(self, action: Any) -> None:
+        if not isinstance(action, dict):
+            raise ActionValidationError("Action must be a dict")
+
+        action_type = action.get("action")
+        if action_type not in self.ALLOWED_ACTIONS:
+            raise ActionValidationError(f"Invalid action type: {action_type}")
+
+        if action_type == "tap":
+            self._validate_coordinates(action.get("coordinates"))
+        elif action_type == "swipe":
+            if "coordinates" in action and "coordinate2" in action:
+                self._validate_coordinates(action.get("coordinates"))
+                self._validate_coordinates(action.get("coordinate2"))
+            else:
+                direction = action.get("direction", "down")
+                if direction not in self.ALLOWED_DIRECTIONS:
+                    raise ActionValidationError(f"Invalid swipe direction: {direction}")
+        elif action_type == "type":
+            text = action.get("text", "")
+            if not isinstance(text, str):
+                raise ActionValidationError("Type action text must be a string")
+            if len(text) > 1000:
+                raise ActionValidationError("Type action text exceeds maximum length")
+        elif action_type == "wait":
+            wait_time = action.get("waitTime", DEFAULT_WAIT_TIME_MS)
+            try:
+                wait_ms = int(wait_time)
+            except (ValueError, TypeError):
+                raise ActionValidationError(f"Invalid waitTime: {wait_time}")
+            if not (MIN_WAIT_TIME_MS <= wait_ms <= MAX_WAIT_TIME_MS):
+                raise ActionValidationError(f"waitTime out of bounds: {wait_ms}")
+
+    @staticmethod
+    def _validate_coordinates(coords: Any) -> None:
+        if not isinstance(coords, (list, tuple)) or len(coords) < 2:
+            raise ActionValidationError(f"Invalid coordinates: {coords}")
+        x_norm, y_norm = coords[0], coords[1]
+        if not isinstance(x_norm, (int, float)) or not isinstance(y_norm, (int, float)):
+            raise ActionValidationError(f"Coordinates must be numeric: {coords}")
+        if not (0.0 <= x_norm <= 1.0 and 0.0 <= y_norm <= 1.0):
+            raise ActionValidationError(f"Normalized coordinates must be in [0, 1]: {coords}")
+
+
+# =============================================================================
 # ActionExecutor
 # =============================================================================
 class ActionExecutor:
@@ -190,7 +326,7 @@ class ActionExecutor:
             else:
                 logging.warning("Unknown action type: %s", action_type)
 
-        except Exception as exc:
+        except (subprocess.CalledProcessError, OSError) as exc:
             logging.error("Action execution failed: %s", exc)
             raise RecoverableTaskError(
                 f"Action {action_type} failed: {exc}"
@@ -200,8 +336,15 @@ class ActionExecutor:
 
     def _tap(self, action: Dict[str, Any]) -> None:
         coords = action.get("coordinates", [0, 0])
-        x = int(coords[0] * self.width)
-        y = int(coords[1] * self.height)
+        if not isinstance(coords, (list, tuple)) or len(coords) < 2:
+            raise ValueError(f"Invalid coordinates: {coords}")
+        x_norm, y_norm = coords[0], coords[1]
+        if not isinstance(x_norm, (int, float)) or not isinstance(y_norm, (int, float)):
+            raise ValueError(f"Coordinates must be numeric: {coords}")
+        if not (0.0 <= x_norm <= 1.0 and 0.0 <= y_norm <= 1.0):
+            raise ValueError(f"Normalized coordinates must be in [0, 1]: {coords}")
+        x = int(x_norm * self.width)
+        y = int(y_norm * self.height)
         self.adb.tap(x, y)
 
     def _swipe(self, action: Dict[str, Any]) -> None:
@@ -209,6 +352,9 @@ class ActionExecutor:
         if "coordinate2" in action and "coordinates" in action:
             start = action["coordinates"]
             end = action["coordinate2"]
+            if (not isinstance(start, (list, tuple)) or len(start) < 2 or
+                    not isinstance(end, (list, tuple)) or len(end) < 2):
+                raise ValueError("Invalid swipe coordinates")
             x1 = int(start[0] * self.width)
             y1 = int(start[1] * self.height)
             x2 = int(end[0] * self.width)
@@ -216,6 +362,8 @@ class ActionExecutor:
             self.adb.swipe(x1, y1, x2, y2)
         else:
             direction = action.get("direction", "down")
+            if direction not in {"down", "up", "left", "right"}:
+                raise ValueError(f"Invalid swipe direction: {direction}")
             self._swipe_direction(direction)
 
     def _swipe_direction(self, direction: str) -> None:
@@ -233,11 +381,18 @@ class ActionExecutor:
 
     def _type(self, action: Dict[str, Any]) -> None:
         text = action.get("text", "")
+        if not isinstance(text, str):
+            text = str(text)
         self.adb.type_text(text)
 
     def _wait(self, action: Dict[str, Any]) -> None:
         wait_time = action.get("waitTime", DEFAULT_WAIT_TIME_MS)
-        time.sleep(int(wait_time) / 1000)
+        try:
+            wait_ms = int(wait_time)
+        except (ValueError, TypeError):
+            wait_ms = DEFAULT_WAIT_TIME_MS
+        wait_ms = max(MIN_WAIT_TIME_MS, min(wait_ms, MAX_WAIT_TIME_MS))
+        time.sleep(wait_ms / 1000)
 
 
 # =============================================================================
@@ -262,54 +417,63 @@ class TaskOrchestrator:
         self.check_completion = config["check_completion"]
         self.max_history = config["max_history"]
         self.previous_actions: List[Dict[str, Any]] = []
+        self.executor = ActionExecutor(
+            adb, (config["screen_width"], config["screen_height"])
+        )
+        self._validator = ActionValidator()
 
     def run(self, task: str) -> Dict[str, Any]:
         """Execute a task and return the result dict."""
-        logging.info("Starting task: %s", task)
+        logging.info("Starting task (length=%d, description redacted)", len(task))
         self.previous_actions.clear()
 
-        for cycle in range(1, self.max_cycles + 1):
-            logging.info("--- Cycle %d/%d ---", cycle, self.max_cycles)
+        try:
+            for cycle in range(1, self.max_cycles + 1):
+                logging.info("--- Cycle %d/%d ---", cycle, self.max_cycles)
 
-            if not self.adb.is_connected():
-                logging.error("Device disconnected")
-                return {"success": False, "message": "Device disconnected"}
+                if not self.adb.is_connected():
+                    logging.error("Device disconnected")
+                    return {"success": False, "message": "Device disconnected"}
 
-            screenshot_path = self.screenshot.capture_with_resize()
-            if not screenshot_path:
-                logging.error("Failed to capture screenshot")
-                time.sleep(self.step_delay * 2)
-                continue
+                screenshot_path = self.screenshot.capture_with_resize()
+                if not screenshot_path:
+                    logging.error("Failed to capture screenshot")
+                    time.sleep(self.step_delay * 2)
+                    continue
 
-            if self.check_completion and self._check_completion(screenshot_path, task):
-                return {"success": True, "message": "Task completed"}
+                if self.check_completion and self._check_completion(screenshot_path, task):
+                    return {"success": True, "message": "Task completed"}
 
-            context = {"previous_actions": self.previous_actions}
-            action = self.provider.analyze_screenshot(screenshot_path, task, context)
+                context = {"previous_actions": self.previous_actions}
+                action = self.provider.analyze_screenshot(screenshot_path, task, context)
 
-            if not action:
-                logging.error("Failed to get action from model")
+                if not action:
+                    logging.error("Failed to get action from model")
+                    time.sleep(self.step_delay)
+                    continue
+
+                self._validator.validate(action)
+                self._record_action(action)
+                try:
+                    should_continue = self._execute_action(action)
+                except RecoverableTaskError as exc:
+                    logging.warning("Recoverable error in action, retrying after delay: %s", exc)
+                    time.sleep(self.step_delay * 2)
+                    continue
+                if not should_continue:
+                    return {"success": True, "message": "Task completed"}
+
                 time.sleep(self.step_delay)
-                continue
 
-            self._record_action(action)
-            should_continue = self._execute_action(action)
-            if not should_continue:
-                return {"success": True, "message": "Task completed"}
-
-            time.sleep(self.step_delay)
-
-        return {
-            "success": False,
-            "message": f"Max cycles ({self.max_cycles}) reached",
-        }
+            return {
+                "success": False,
+                "message": f"Max cycles ({self.max_cycles}) reached",
+            }
+        finally:
+            self.screenshot.cleanup_old(keep_count=50)
 
     def _execute_action(self, action: Dict[str, Any]) -> bool:
-        executor = ActionExecutor(
-            self.adb,
-            (self.config["screen_width"], self.config["screen_height"]),
-        )
-        return executor.execute(action)
+        return self.executor.execute(action)
 
     def _record_action(self, action: Dict[str, Any]) -> None:
         self.previous_actions.append(action)
@@ -323,7 +487,7 @@ class TaskOrchestrator:
             if result.get("complete"):
                 logging.info("Task completion detected: %s", result.get("reason", ""))
                 return True
-        except Exception as exc:
+        except (OSError, ValueError, TypeError) as exc:
             logging.warning("Completion check failed: %s", exc)
         return False
 
@@ -386,34 +550,102 @@ class PhoneAgent:
         """Execute a task and return the result."""
         return self._orchestrator.run(task)
 
+    def cleanup(self) -> None:
+        """Release all held resources and clear sensitive state."""
+        if self.vl_agent and hasattr(self.vl_agent, 'close'):
+            try:
+                self.vl_agent.close()
+            except Exception as exc:
+                logging.warning("Provider cleanup failed: %s", exc)
+
+        try:
+            self.screenshot.cleanup_old(keep_count=50)
+        except Exception as exc:
+            logging.warning("Screenshot cleanup failed: %s", exc)
+
+        if self._orchestrator:
+            self._orchestrator.previous_actions.clear()
+
+        # Best-effort clear of API key from config
+        self.config.pop("api_key", None)
+
+
+# =============================================================================
+# Config loading helpers
+# =============================================================================
+def _validate_config_path(config_path: Path) -> None:
+    """Validate that the config path is safe to load."""
+    if not config_path.exists():
+        return
+
+    if config_path.is_symlink():
+        raise ValueError(f"Config path is a symlink: {config_path}")
+    if not config_path.is_file():
+        raise ValueError(f"Config path is not a regular file: {config_path}")
+
+    try:
+        size = config_path.stat().st_size
+    except OSError as exc:
+        raise ValueError(f"Cannot stat config file: {config_path}") from exc
+    if size > MAX_CONFIG_SIZE:
+        raise ValueError(f"Config file too large: {size} bytes")
+
+    st = config_path.stat()
+    if st.st_uid != os.getuid():
+        raise PermissionError(f"Config file must be owned by current user: {config_path}")
+    if stat.S_IWOTH & st.st_mode:
+        raise PermissionError(f"Config file must not be world-writable: {config_path}")
+
+
+def _load_config(config_path: Path) -> Dict[str, Any]:
+    """Load and validate config file."""
+    _validate_config_path(config_path)
+    if not config_path.exists():
+        logging.warning("Config file not found: %s, using defaults", config_path)
+        return {}
+
+    try:
+        with open(config_path, encoding="utf-8") as f:
+            config = json.load(f)
+        if not isinstance(config, dict):
+            logging.error("Config file must contain a JSON object")
+            sys.exit(1)
+        return config
+    except json.JSONDecodeError as exc:
+        logging.error("Failed to parse config file: %s", exc)
+        sys.exit(1)
+    except OSError as exc:
+        logging.error("Failed to read config file: %s", exc)
+        sys.exit(1)
+
 
 # =============================================================================
 # CLI entry point
 # =============================================================================
 def main() -> None:
+    # Load environment variables only at CLI entry point
+    dotenv_path = Path(__file__).resolve().parent / '.env'
+    if dotenv_path.exists():
+        load_dotenv(dotenv_path=dotenv_path, override=False)
+
+    _setup_logging()
+
     parser = argparse.ArgumentParser(description="PhoneDriver API - Mobile Automation")
     parser.add_argument("task", help='Task description (e.g., "Open Settings")')
     parser.add_argument("--config", default="config.json", help="Config file path")
     args = parser.parse_args()
 
-    config_path = Path(args.config)
-    config: Dict[str, Any] = {}
-    if config_path.exists():
-        try:
-            with open(config_path, encoding="utf-8") as f:
-                config = json.load(f)
-            if not isinstance(config, dict):
-                logging.error("Config file must contain a JSON object")
-                sys.exit(1)
-        except json.JSONDecodeError as exc:
-            logging.error("Failed to parse config file: %s", exc)
-            sys.exit(1)
-        except OSError as exc:
-            logging.error("Failed to read config file: %s", exc)
-            sys.exit(1)
-    else:
-        logging.warning("Config file not found: %s, using defaults", config_path)
+    config_path = Path(args.config).resolve()
+    allowed_base = Path.cwd().resolve()
+    try:
+        config_path.relative_to(allowed_base)
+    except ValueError as exc:
+        logging.error("Config path must be inside the current working directory: %s", config_path)
+        sys.exit(1)
 
+    config = _load_config(config_path)
+
+    agent: Optional[PhoneAgent] = None
     try:
         agent = PhoneAgent(config)
         result = agent.execute_task(args.task)
@@ -427,8 +659,12 @@ def main() -> None:
     except (KeyboardInterrupt, SystemExit):
         raise
     except Exception as exc:
-        logging.exception("Fatal error: %s", exc)
+        safe_msg = re.sub(r"key=[a-zA-Z0-9_\-\.]+", "key=<REDACTED>", str(exc))
+        logging.error("Fatal error: %s", safe_msg)
         sys.exit(1)
+    finally:
+        if agent is not None:
+            agent.cleanup()
 
 
 if __name__ == "__main__":
