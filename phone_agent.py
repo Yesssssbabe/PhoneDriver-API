@@ -18,13 +18,16 @@ from __future__ import annotations
 
 import argparse
 import copy
+import fcntl
 import json
 import logging
+import math
 import os
 import re
 import stat
 import subprocess
 import sys
+import tempfile
 import time
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
@@ -35,7 +38,14 @@ class SecureRotatingFileHandler(RotatingFileHandler):
     """RotatingFileHandler that creates log files with restrictive permissions."""
 
     def _open(self):
-        stream = super()._open()
+        # Reject symlinks to prevent log redirection attacks.
+        if os.path.exists(self.baseFilename) and os.path.islink(self.baseFilename):
+            raise ValueError(f"Log file is a symlink: {self.baseFilename}")
+        old_umask = os.umask(0o077)
+        try:
+            stream = super()._open()
+        finally:
+            os.umask(old_umask)
         if os.name != "nt":
             try:
                 os.chmod(self.baseFilename, 0o600)
@@ -63,10 +73,16 @@ DEFAULT_TEMPERATURE: float = 0.1
 DEFAULT_MAX_TOKENS: int = 512
 DEFAULT_MAX_RETRIES: int = 3
 DEFAULT_WAIT_TIME_MS: int = 1000
+DEFAULT_MAX_API_CALLS: int = 200
 
 MAX_WAIT_TIME_MS: int = 30000
 MIN_WAIT_TIME_MS: int = 0
 MAX_CONFIG_SIZE: int = 64 * 1024  # 64 KB
+MAX_MAX_CYCLES: int = 50
+MAX_STEP_DELAY: float = 10.0
+MAX_MAX_RETRIES: int = 10
+MAX_MAX_HISTORY: int = 100
+MAX_SCREEN_DIM: int = 16384
 
 API_KEY_ENV_MAP: Dict[str, str] = {
     "kimi_code": "KIMI_CODE_API_KEY",
@@ -82,10 +98,11 @@ API_KEY_ENV_MAP: Dict[str, str] = {
 class APIScrubFilter(logging.Filter):
     """Redact API keys and Bearer tokens from log records."""
 
+    # Bounded, linear-time patterns to avoid ReDoS on long log messages.
     _PATTERNS = [
-        (re.compile(r"(Bearer\s+)[a-zA-Z0-9_\-\.]+"), r"\1<REDACTED>"),
-        (re.compile(r"([_A-Z]*API_KEY\s*[:=]?\s*)[^\s'\"]+", re.IGNORECASE), r"\1<REDACTED>"),
-        (re.compile(r"(Authorization\s*[:=]?\s*)[^\s'\"]+", re.IGNORECASE), r"\1<REDACTED>"),
+        (re.compile(r"Bearer\s+[a-zA-Z0-9_\-\.]{0,200}"), "Bearer <REDACTED>"),
+        (re.compile(r"[A-Z_]{0,20}API_KEY\s*[:=]?\s*\S{0,400}", re.IGNORECASE), "API_KEY=<REDACTED>"),
+        (re.compile(r"Authorization\s*[:=]?\s*\S{0,400}", re.IGNORECASE), "Authorization=<REDACTED>"),
     ]
 
     def filter(self, record: logging.LogRecord) -> bool:
@@ -110,13 +127,20 @@ class APIScrubFilter(logging.Filter):
 def _setup_logging() -> None:
     """Configure logging with rotation and API key scrubbing."""
     log_path = Path("phone_agent.log")
-    if not log_path.exists():
-        log_path.touch(mode=0o600)
-    elif os.name != "nt":
-        try:
-            os.chmod(log_path, 0o600)
-        except OSError:
-            pass
+    if log_path.exists():
+        if log_path.is_symlink():
+            raise ValueError(f"Log path is a symlink: {log_path}")
+        if not log_path.is_file():
+            raise ValueError(f"Log path is not a regular file: {log_path}")
+        if os.name != "nt":
+            try:
+                os.chmod(log_path, 0o600)
+            except OSError:
+                pass
+    else:
+        # Atomic creation with restrictive permissions (no symlink following).
+        fd = os.open(str(log_path), os.O_CREAT | os.O_WRONLY, 0o600)
+        os.close(fd)
 
     formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
     scrubber = APIScrubFilter()
@@ -181,12 +205,18 @@ class ConfigResolver:
         temperature = self._float(cfg.get("temperature"), DEFAULT_TEMPERATURE)
         cfg["temperature"] = max(0.0, min(2.0, temperature))
         cfg["max_tokens"] = max(1, min(4096, self._int(cfg.get("max_tokens"), DEFAULT_MAX_TOKENS)))
-        cfg["max_retries"] = max(0, self._int(cfg.get("max_retries"), DEFAULT_MAX_RETRIES))
-        cfg["max_cycles"] = max(1, self._int(cfg.get("max_cycles"), DEFAULT_MAX_CYCLES))
-        cfg["step_delay"] = max(0.0, self._float(cfg.get("step_delay"), DEFAULT_STEP_DELAY))
-        cfg["max_history"] = max(1, self._int(cfg.get("max_history"), DEFAULT_MAX_HISTORY))
+        cfg["max_retries"] = max(0, min(MAX_MAX_RETRIES, self._int(cfg.get("max_retries"), DEFAULT_MAX_RETRIES)))
+        cfg["max_cycles"] = max(1, min(MAX_MAX_CYCLES, self._int(cfg.get("max_cycles"), DEFAULT_MAX_CYCLES)))
+
+        step_delay = self._float(cfg.get("step_delay"), DEFAULT_STEP_DELAY)
+        if not math.isfinite(step_delay) or step_delay < 0.0:
+            step_delay = DEFAULT_STEP_DELAY
+        cfg["step_delay"] = max(0.0, min(MAX_STEP_DELAY, step_delay))
+
+        cfg["max_history"] = max(1, min(MAX_MAX_HISTORY, self._int(cfg.get("max_history"), DEFAULT_MAX_HISTORY)))
         cfg["check_completion"] = bool(cfg.get("check_completion", True))
         cfg["auto_detect_resolution"] = bool(cfg.get("auto_detect_resolution", True))
+        cfg.setdefault("max_api_calls", DEFAULT_MAX_API_CALLS)
 
         screenshot_dir = cfg.get("screenshot_dir", "./screenshots")
         screenshot_path = Path(screenshot_dir).resolve()
@@ -204,9 +234,9 @@ class ConfigResolver:
 
     def _resolve_provider(self, cfg: Dict[str, Any]) -> str:
         if cfg.get("provider"):
-            return str(cfg["provider"]).lower()
+            return str(cfg["provider"]).casefold()
         if self.use_env_fallback:
-            return os.environ.get("PROVIDER", "kimi_code").lower()
+            return os.environ.get("PROVIDER", "kimi_code").casefold()
         return "kimi_code"
 
     def _resolve_api_key(self, cfg: Dict[str, Any], provider: str) -> str:
@@ -217,7 +247,15 @@ class ConfigResolver:
             return ""
         # Provider-specific env var, then generic API_KEY fallback.
         env_var = API_KEY_ENV_MAP.get(provider, "API_KEY")
-        return os.environ.get(env_var) or os.environ.get("API_KEY", "")
+        api_key = os.environ.get(env_var) or os.environ.get("API_KEY", "")
+        # Best-effort removal from the process environment to reduce /proc exposure.
+        if env_var in os.environ:
+            del os.environ[env_var]
+            os.unsetenv(env_var)
+        if "API_KEY" in os.environ:
+            del os.environ["API_KEY"]
+            os.unsetenv("API_KEY")
+        return api_key
 
     def _resolve_model(self, cfg: Dict[str, Any]) -> Optional[str]:
         if cfg.get("model"):
@@ -230,14 +268,14 @@ class ConfigResolver:
     def _int(value: Any, default: int) -> int:
         try:
             return int(value)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             return default
 
     @staticmethod
     def _float(value: Any, default: float) -> float:
         try:
             return float(value)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             return default
 
 
@@ -249,6 +287,8 @@ class ActionValidator:
 
     ALLOWED_ACTIONS = {"tap", "swipe", "type", "wait", "terminate"}
     ALLOWED_DIRECTIONS = {"down", "up", "left", "right"}
+    # Reject common shell metacharacters, path traversal, and script tags in typed text.
+    _SUSPICIOUS_TEXT_RE = re.compile(r"[;|&`$()<>\\\x00]|(?:\.\./)|(?:<\s*script)", re.IGNORECASE)
 
     def validate(self, action: Any) -> None:
         if not isinstance(action, dict):
@@ -274,6 +314,8 @@ class ActionValidator:
                 raise ActionValidationError("Type action text must be a string")
             if len(text) > 1000:
                 raise ActionValidationError("Type action text exceeds maximum length")
+            if self._SUSPICIOUS_TEXT_RE.search(text):
+                raise ActionValidationError("Type text contains suspicious characters")
         elif action_type == "wait":
             wait_time = action.get("waitTime", DEFAULT_WAIT_TIME_MS)
             try:
@@ -302,7 +344,9 @@ class ActionExecutor:
 
     def __init__(self, adb: ADBClient, screen_size: Tuple[int, int]):
         self.adb = adb
-        self.width, self.height = screen_size
+        width, height = screen_size
+        self.width = max(1, min(int(width), MAX_SCREEN_DIM))
+        self.height = max(1, min(int(height), MAX_SCREEN_DIM))
 
     def execute(self, action: Dict[str, Any]) -> bool:
         """Execute an action. Returns False when the task should terminate."""
@@ -343,8 +387,11 @@ class ActionExecutor:
             raise ValueError(f"Coordinates must be numeric: {coords}")
         if not (0.0 <= x_norm <= 1.0 and 0.0 <= y_norm <= 1.0):
             raise ValueError(f"Normalized coordinates must be in [0, 1]: {coords}")
-        x = int(x_norm * self.width)
-        y = int(y_norm * self.height)
+        try:
+            x = int(x_norm * self.width)
+            y = int(y_norm * self.height)
+        except OverflowError as exc:
+            raise ValueError("Coordinate overflow") from exc
         self.adb.tap(x, y)
 
     def _swipe(self, action: Dict[str, Any]) -> None:
@@ -355,10 +402,13 @@ class ActionExecutor:
             if (not isinstance(start, (list, tuple)) or len(start) < 2 or
                     not isinstance(end, (list, tuple)) or len(end) < 2):
                 raise ValueError("Invalid swipe coordinates")
-            x1 = int(start[0] * self.width)
-            y1 = int(start[1] * self.height)
-            x2 = int(end[0] * self.width)
-            y2 = int(end[1] * self.height)
+            try:
+                x1 = int(start[0] * self.width)
+                y1 = int(start[1] * self.height)
+                x2 = int(end[0] * self.width)
+                y2 = int(end[1] * self.height)
+            except OverflowError as exc:
+                raise ValueError("Coordinate overflow") from exc
             self.adb.swipe(x1, y1, x2, y2)
         else:
             direction = action.get("direction", "down")
@@ -416,20 +466,44 @@ class TaskOrchestrator:
         self.step_delay = config["step_delay"]
         self.check_completion = config["check_completion"]
         self.max_history = config["max_history"]
+        self.max_api_calls = max(1, int(config.get("max_api_calls", DEFAULT_MAX_API_CALLS)))
+        self._api_calls = 0
+        self._per_cycle_timeout = float(config.get("per_cycle_timeout_seconds", 45.0))
         self.previous_actions: List[Dict[str, Any]] = []
         self.executor = ActionExecutor(
             adb, (config["screen_width"], config["screen_height"])
         )
         self._validator = ActionValidator()
 
+    # Dangerous task keywords that require explicit operator override.
+    _DANGEROUS_KEYWORDS = {"factory reset", "erase all", "uninstall all", "wipe data"}
+
     def run(self, task: str) -> Dict[str, Any]:
         """Execute a task and return the result dict."""
         logging.info("Starting task (length=%d, description redacted)", len(task))
         self.previous_actions.clear()
+        self._api_calls = 0
+
+        # Block clearly destructive task descriptions unless explicitly allowed.
+        task_lower = task.lower()
+        if (
+            any(kw in task_lower for kw in self._DANGEROUS_KEYWORDS)
+            and not self.config.get("allow_dangerous_tasks", False)
+        ):
+            return {
+                "success": False,
+                "message": "Task blocked: dangerous keyword detected. Set allow_dangerous_tasks=true to override.",
+            }
 
         try:
+            calls_per_cycle = 2 if self.check_completion else 1
             for cycle in range(1, self.max_cycles + 1):
                 logging.info("--- Cycle %d/%d ---", cycle, self.max_cycles)
+                cycle_start = time.monotonic()
+                cycle_deadline = cycle_start + self._per_cycle_timeout
+
+                if self._api_calls + calls_per_cycle > self.max_api_calls:
+                    return {"success": False, "message": "Budget exceeded (max_api_calls)"}
 
                 if not self.adb.is_connected():
                     logging.error("Device disconnected")
@@ -441,19 +515,35 @@ class TaskOrchestrator:
                     time.sleep(self.step_delay * 2)
                     continue
 
-                if self.check_completion and self._check_completion(screenshot_path, task):
+                # Completion checks are only trusted after at least one action cycle.
+                if (
+                    self.check_completion
+                    and cycle >= 2
+                    and self._check_completion(screenshot_path, task)
+                ):
                     return {"success": True, "message": "Task completed"}
+                self._api_calls += 1
+
+                if time.monotonic() > cycle_deadline:
+                    return {"success": False, "message": "Per-cycle timeout exceeded"}
 
                 context = {"previous_actions": self.previous_actions}
                 action = self.provider.analyze_screenshot(screenshot_path, task, context)
+                self._api_calls += 1
 
                 if not action:
                     logging.error("Failed to get action from model")
                     time.sleep(self.step_delay)
                     continue
 
+                if time.monotonic() > cycle_deadline:
+                    return {"success": False, "message": "Per-cycle timeout exceeded"}
+
                 self._validator.validate(action)
                 self._record_action(action)
+                if self._detect_action_loop():
+                    return {"success": False, "message": "Action loop detected"}
+
                 try:
                     should_continue = self._execute_action(action)
                 except RecoverableTaskError as exc:
@@ -464,6 +554,13 @@ class TaskOrchestrator:
                     return {"success": True, "message": "Task completed"}
 
                 time.sleep(self.step_delay)
+
+                # Periodic cleanup to avoid unbounded disk use during long tasks.
+                if cycle % 10 == 0:
+                    try:
+                        self.screenshot.cleanup_old(keep_count=50)
+                    except Exception as exc:
+                        logging.warning("Periodic screenshot cleanup failed: %s", exc)
 
             return {
                 "success": False,
@@ -476,9 +573,27 @@ class TaskOrchestrator:
         return self.executor.execute(action)
 
     def _record_action(self, action: Dict[str, Any]) -> None:
-        self.previous_actions.append(action)
+        # Store a redacted copy so typed passwords don't linger in memory.
+        safe_action = dict(action)
+        if safe_action.get("action") == "type" and "text" in safe_action:
+            safe_action["text"] = "[REDACTED]"
+        self.previous_actions.append(safe_action)
         if len(self.previous_actions) > self.max_history:
             self.previous_actions = self.previous_actions[-self.max_history :]
+
+    def _detect_action_loop(self) -> bool:
+        """Detect repeated identical actions or short action cycles."""
+        if len(self.previous_actions) < 5:
+            return False
+        recent = self.previous_actions[-5:]
+        if all(a == recent[0] for a in recent):
+            return True
+        for cycle_len in range(2, 5):
+            if len(self.previous_actions) >= cycle_len * 2:
+                tail = self.previous_actions[-cycle_len * 2:]
+                if tail[:cycle_len] == tail[cycle_len:]:
+                    return True
+        return False
 
     def _check_completion(self, screenshot_path: str, task: str) -> bool:
         try:
@@ -505,6 +620,8 @@ class PhoneAgent:
         self.adb = ADBClient()
         self.screenshot = ScreenshotCapture(self.adb, self.config["screenshot_dir"])
         self.vl_agent = self._create_provider()
+        # Let the provider coordinate screenshot read references with cleanup.
+        self.vl_agent._screenshot_capture = self.screenshot
         self._init_screen_resolution()
 
         self._orchestrator = TaskOrchestrator(
@@ -595,6 +712,8 @@ def _validate_config_path(config_path: Path) -> None:
         raise PermissionError(f"Config file must be owned by current user: {config_path}")
     if stat.S_IWOTH & st.st_mode:
         raise PermissionError(f"Config file must not be world-writable: {config_path}")
+    if stat.S_IROTH & st.st_mode:
+        raise PermissionError(f"Config file must not be world-readable: {config_path}")
 
 
 def _load_config(config_path: Path) -> Dict[str, Any]:
@@ -622,49 +741,95 @@ def _load_config(config_path: Path) -> Dict[str, Any]:
 # =============================================================================
 # CLI entry point
 # =============================================================================
-def main() -> None:
-    # Load environment variables only at CLI entry point
-    dotenv_path = Path(__file__).resolve().parent / '.env'
-    if dotenv_path.exists():
-        load_dotenv(dotenv_path=dotenv_path, override=False)
+def _validate_dotenv_permissions(dotenv_path: Path) -> None:
+    """Reject world-readable or world-writable .env files."""
+    if not dotenv_path.exists():
+        return
+    st = dotenv_path.stat()
+    if stat.S_IROTH & st.st_mode:
+        raise PermissionError(f".env file must not be world-readable: {dotenv_path}")
+    if stat.S_IWOTH & st.st_mode:
+        raise PermissionError(f".env file must not be world-writable: {dotenv_path}")
 
-    _setup_logging()
 
-    parser = argparse.ArgumentParser(description="PhoneDriver API - Mobile Automation")
-    parser.add_argument("task", help='Task description (e.g., "Open Settings")')
-    parser.add_argument("--config", default="config.json", help="Config file path")
-    args = parser.parse_args()
-
-    config_path = Path(args.config).resolve()
-    allowed_base = Path.cwd().resolve()
-    try:
-        config_path.relative_to(allowed_base)
-    except ValueError as exc:
-        logging.error("Config path must be inside the current working directory: %s", config_path)
+def _require_non_root() -> None:
+    """Refuse to run as root unless explicitly allowed."""
+    if not hasattr(os, "geteuid"):
+        return
+    if os.geteuid() == 0 and os.environ.get("PHONEDRIVER_ALLOW_ROOT") != "1":
+        print(
+            "Running as root is not allowed. Set PHONEDRIVER_ALLOW_ROOT=1 to override.",
+            file=sys.stderr,
+        )
         sys.exit(1)
 
-    config = _load_config(config_path)
 
-    agent: Optional[PhoneAgent] = None
+def _acquire_instance_lock() -> Any:
+    """Acquire a cross-process lock to prevent concurrent CLI instances."""
+    lock_path = Path(tempfile.gettempdir()) / "phone_agent.lock"
     try:
-        agent = PhoneAgent(config)
-        result = agent.execute_task(args.task)
+        lock_file = open(lock_path, "w")
+        fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return lock_file
+    except (BlockingIOError, OSError):
+        logging.error("Another PhoneDriver instance is already running.")
+        sys.exit(1)
 
-        if result["success"]:
-            logging.info("Task completed successfully: %s", result["message"])
-        else:
-            logging.error("Task failed: %s", result["message"])
+
+def main() -> None:
+    _require_non_root()
+    lock_file = _acquire_instance_lock()
+
+    try:
+        # Load environment variables only at CLI entry point
+        dotenv_path = Path(__file__).resolve().parent / '.env'
+        _validate_dotenv_permissions(dotenv_path)
+        if dotenv_path.exists():
+            load_dotenv(dotenv_path=dotenv_path, override=False)
+
+        _setup_logging()
+
+        parser = argparse.ArgumentParser(description="PhoneDriver API - Mobile Automation")
+        parser.add_argument("task", help='Task description (e.g., "Open Settings")')
+        parser.add_argument("--config", default="config.json", help="Config file path")
+        args = parser.parse_args()
+
+        config_path = Path(args.config).resolve()
+        allowed_base = Path.cwd().resolve()
+        try:
+            config_path.relative_to(allowed_base)
+        except ValueError as exc:
+            logging.error("Config path must be inside the current working directory: %s", config_path)
             sys.exit(1)
 
-    except (KeyboardInterrupt, SystemExit):
-        raise
-    except Exception as exc:
-        safe_msg = re.sub(r"key=[a-zA-Z0-9_\-\.]+", "key=<REDACTED>", str(exc))
-        logging.error("Fatal error: %s", safe_msg)
-        sys.exit(1)
+        config = _load_config(config_path)
+
+        agent: Optional[PhoneAgent] = None
+        try:
+            agent = PhoneAgent(config)
+            result = agent.execute_task(args.task)
+
+            if result["success"]:
+                logging.info("Task completed successfully: %s", result["message"])
+            else:
+                logging.error("Task failed: %s", result["message"])
+                sys.exit(1)
+
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except Exception as exc:
+            safe_msg = re.sub(r"key=[a-zA-Z0-9_\-\.]+", "key=<REDACTED>", str(exc))
+            logging.error("Fatal error: %s", safe_msg)
+            sys.exit(1)
+        finally:
+            if agent is not None:
+                agent.cleanup()
     finally:
-        if agent is not None:
-            agent.cleanup()
+        try:
+            fcntl.flock(lock_file, fcntl.LOCK_UN)
+            lock_file.close()
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":

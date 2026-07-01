@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import random
 import threading
 import time
@@ -18,6 +19,9 @@ from enum import Enum, auto
 from typing import Any, Dict, List, Optional
 
 import requests
+
+
+MAX_RESPONSE_BYTES = 1024 * 1024  # 1 MB
 
 
 class CircuitState(Enum):
@@ -36,6 +40,7 @@ class CircuitBreaker:
         self.last_failure_time = 0.0
         self.state = CircuitState.CLOSED
         self._lock = threading.Lock()
+        self._half_open_probe = False
 
     def record_success(self) -> None:
         with self._lock:
@@ -46,7 +51,8 @@ class CircuitBreaker:
         """Record a failure. Returns True if the breaker just opened."""
         with self._lock:
             self.failures += 1
-            self.last_failure_time = time.time()
+            self.last_failure_time = time.monotonic()
+            self._half_open_probe = False
             if self.failures >= self.failure_threshold:
                 self.state = CircuitState.OPEN
                 return True
@@ -57,11 +63,16 @@ class CircuitBreaker:
             if self.state == CircuitState.CLOSED:
                 return True
             if self.state == CircuitState.OPEN:
-                if time.time() - self.last_failure_time > self.recovery_timeout:
+                if time.monotonic() - self.last_failure_time > self.recovery_timeout:
                     self.state = CircuitState.HALF_OPEN
+                    self._half_open_probe = False
                     return True
                 return False
-            return True  # HALF_OPEN allows one probe
+            # HALF_OPEN: only a single probe is allowed.
+            if self._half_open_probe:
+                return False
+            self._half_open_probe = True
+            return True
 
 
 class HttpClient(ABC):
@@ -102,11 +113,16 @@ class OpenAICompatibleClient(HttpClient):
         self.session = session or requests.Session()
         self.session.verify = True
         self.circuit_breaker = CircuitBreaker()
+        self._session_lock = threading.Lock()
+        self._closing = False
 
     def close(self) -> None:
         """Close the requests session and release connections."""
-        if self.session is not None:
-            self.session.close()
+        with self._session_lock:
+            self._closing = True
+            session = self.session
+            if session is not None:
+                session.close()
 
     def chat_completion(
         self,
@@ -134,48 +150,80 @@ class OpenAICompatibleClient(HttpClient):
 
         for attempt in range(1, max_retries + 1):
             try:
-                resp = self.session.post(
-                    url,
-                    headers=self.headers,
-                    json=payload,
-                    timeout=(10.0, timeout),
-                )
-
-                if resp.status_code == 429:
-                    retry_after = self._retry_after(resp)
-                    logging.warning(
-                        "Rate limited (429) on attempt %d/%d, retrying after %.1fs",
-                        attempt,
-                        max_retries,
-                        retry_after,
-                    )
-                    if attempt < max_retries:
-                        time.sleep(retry_after)
-                        continue
-                    return None
-
-                # 4xx errors other than 429 are not worth retrying.
-                if 400 <= resp.status_code < 500 and resp.status_code != 429:
-                    logging.error(
-                        "Non-retriable HTTP error %d from %s. Response body omitted for security.",
-                        resp.status_code,
+                with self._session_lock:
+                    if self._closing:
+                        logging.warning("Request rejected: client is closing")
+                        return None
+                    resp = self.session.post(
                         url,
+                        headers=self.headers,
+                        json=payload,
+                        timeout=(10.0, timeout),
+                        allow_redirects=False,
+                        stream=True,
                     )
-                    self.circuit_breaker.record_failure()
-                    return None
 
-                resp.raise_for_status()
-                data = resp.json()
-                choices = data.get("choices", [])
-                if not isinstance(choices, list) or not choices:
-                    logging.error("Invalid or empty choices in API response")
-                    return None
-                content = choices[0].get("message", {}).get("content")
-                if content is None:
-                    logging.error("Missing content in API response")
-                    return None
-                self.circuit_breaker.record_success()
-                return content
+                with resp:
+                    # Block SSRF-style redirects.
+                    if 300 <= resp.status_code < 400:
+                        logging.error(
+                            "Redirect blocked by SSRF policy: %s -> %s",
+                            url,
+                            resp.headers.get("Location"),
+                        )
+                        self.circuit_breaker.record_failure()
+                        return None
+
+                    if resp.status_code == 429:
+                        retry_after = self._retry_after(resp)
+                        logging.warning(
+                            "Rate limited (429) on attempt %d/%d, retrying after %.1fs",
+                            attempt,
+                            max_retries,
+                            retry_after,
+                        )
+                        if attempt < max_retries:
+                            time.sleep(retry_after)
+                            continue
+                        # Final 429 counts as a failure to prevent runaway retries.
+                        self.circuit_breaker.record_failure()
+                        return None
+
+                    # 4xx errors other than 429 are not worth retrying.
+                    if 400 <= resp.status_code < 500 and resp.status_code != 429:
+                        logging.error(
+                            "Non-retriable HTTP error %d from %s. Response body omitted for security.",
+                            resp.status_code,
+                            url,
+                        )
+                        self.circuit_breaker.record_failure()
+                        return None
+
+                    resp.raise_for_status()
+
+                    content_type = resp.headers.get("Content-Type", "")
+                    if "application/json" not in content_type:
+                        logging.error("Unexpected Content-Type: %s", content_type)
+                        self.circuit_breaker.record_failure()
+                        return None
+
+                    raw = resp.raw.read(MAX_RESPONSE_BYTES + 1)
+                    if len(raw) > MAX_RESPONSE_BYTES:
+                        logging.error("Response body too large: %d bytes", len(raw))
+                        self.circuit_breaker.record_failure()
+                        return None
+
+                    data = json.loads(raw)
+                    choices = data.get("choices", [])
+                    if not isinstance(choices, list) or not choices:
+                        logging.error("Invalid or empty choices in API response")
+                        return None
+                    content = choices[0].get("message", {}).get("content")
+                    if content is None:
+                        logging.error("Missing content in API response")
+                        return None
+                    self.circuit_breaker.record_success()
+                    return content
 
             except requests.exceptions.Timeout as exc:
                 last_error = exc
@@ -225,8 +273,11 @@ class OpenAICompatibleClient(HttpClient):
 
     @staticmethod
     def _retry_after(resp: requests.Response) -> float:
-        """Read Retry-After header, defaulting to 1 second."""
+        """Read Retry-After header, defaulting to 1 second and clamping to 60s."""
         try:
-            return float(resp.headers.get("Retry-After", 1.0))
+            value = float(resp.headers.get("Retry-After", 1.0))
         except (ValueError, TypeError):
-            return 1.0
+            value = 1.0
+        if value < 0 or not math.isfinite(value):
+            value = 1.0
+        return min(value, 60.0)

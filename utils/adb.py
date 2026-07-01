@@ -4,11 +4,19 @@ import logging
 import os
 import re
 import shlex
+import shutil
+import stat
 import subprocess
 import threading
 import uuid
 from pathlib import Path
 from typing import Optional, Tuple
+
+
+# Resolve the absolute adb binary path once at import time and validate it is not
+# world-writable. Fall back to the bare command name if adb is not on PATH so
+# tests and exotic environments keep working.
+_ADB_PATH: str = shutil.which("adb") or "adb"
 
 
 # Constants
@@ -29,7 +37,12 @@ class ADBClient:
 
     def _cmd(self, command: list) -> list:
         """Build ADB command with device ID if specified."""
-        cmd = ['adb']
+        adb_bin = _ADB_PATH
+        if adb_bin != "adb" and os.path.exists(adb_bin):
+            st = os.stat(adb_bin)
+            if stat.S_IWOTH & st.st_mode:
+                raise RuntimeError(f"adb binary is world-writable: {adb_bin}")
+        cmd = [adb_bin]
         if self.device_id:
             if not _DEVICE_ID_RE.match(self.device_id):
                 raise ValueError(f"Invalid device_id: {self.device_id}")
@@ -39,11 +52,19 @@ class ADBClient:
 
     @staticmethod
     def _sanitize_env() -> dict:
-        """Return a copy of the environment with API keys stripped."""
-        safe_env = os.environ.copy()
+        """Return a minimal, hardened environment for ADB subprocesses."""
+        allowed = {
+            'PATH', 'HOME', 'USER', 'SHELL', 'TERM', 'DISPLAY', 'XAUTHORITY',
+            'ANDROID_SDK_HOME', 'ANDROID_HOME', 'TMPDIR', 'TEMP',
+        }
+        safe_env = {k: v for k, v in os.environ.items() if k in allowed}
+        # Strip any dynamic-linker variables that may have survived the whitelist.
         for key in list(safe_env.keys()):
-            if key.endswith('_API_KEY') or key == 'API_KEY':
+            if key.startswith('LD_'):
                 del safe_env[key]
+        # Ensure a sane, minimal PATH so the real adb binary is found.
+        if 'PATH' not in safe_env or not safe_env.get('PATH'):
+            safe_env['PATH'] = '/usr/bin:/bin:/usr/local/bin'
         return safe_env
 
     @staticmethod
@@ -78,9 +99,14 @@ class ADBClient:
                 return -1, "", "Timeout"
             except subprocess.CalledProcessError as e:
                 safe_stderr = (e.stderr or "")[:200].replace("\n", " ")
-                logging.error("ADB command failed: %s - %s", self._sanitize_cmd(cmd), safe_stderr)
+                safe_cmd = self._sanitize_cmd(cmd)
+                logging.error("ADB command failed: %s - %s", safe_cmd, safe_stderr)
                 if check:
-                    raise
+                    # Re-raise with a sanitized command string so the exception
+                    # object does not leak sensitive typed text.
+                    raise subprocess.CalledProcessError(
+                        e.returncode, safe_cmd, e.stdout, safe_stderr
+                    ) from e
                 return e.returncode, e.stdout, e.stderr
 
     def _shell(self, command: str) -> str:
@@ -115,6 +141,41 @@ class ADBClient:
         self.run(['shell', f'input swipe {x1} {y1} {x2} {y2} {duration}'], check=True)
         logging.info("Swiped from (%d, %d) to (%d, %d)", x1, y1, x2, y2)
 
+    def _run_shell_input(self, command: str, check: bool = True, timeout: int = 30) -> Tuple[int, str, str]:
+        """Run a single shell command via `adb shell` using stdin.
+
+        Passing the command through stdin keeps sensitive text out of the host
+        process command line (``ps`` / ``/proc/*/cmdline``).
+        """
+        with self._lock:
+            cmd = self._cmd(['shell'])
+            safe_env = self._sanitize_env()
+            proc = subprocess.Popen(
+                cmd,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding='utf-8',
+                errors='replace',
+                env=safe_env,
+            )
+            try:
+                stdout, stderr = proc.communicate(input=command + "\n", timeout=timeout)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                stdout, stderr = proc.communicate()
+                logging.error("ADB shell command timed out: %s", self._sanitize_cmd(cmd))
+                if check:
+                    raise subprocess.TimeoutExpired(cmd, timeout)
+                return -1, stdout, stderr
+
+            if check and proc.returncode != 0:
+                safe_stderr = stderr[:200].replace("\n", " ")
+                safe_cmd = self._sanitize_cmd(cmd)
+                raise subprocess.CalledProcessError(proc.returncode, safe_cmd, stdout, safe_stderr)
+            return proc.returncode, stdout, stderr
+
     def type_text(self, text: str) -> None:
         """Type text via ADB.
 
@@ -137,10 +198,12 @@ class ADBClient:
             safe_text = text.replace(' ', '%s')
             # Properly escape the argument for the shell
             quoted = shlex.quote(safe_text)
-            self.run(['shell', f'input text {quoted}'], check=True)
+            # Use stdin to avoid exposing text in the host process list.
+            self._run_shell_input(f'input text {quoted}', check=True)
             logging.info("Typed text (length=%d, redacted)", len(text))
         except (subprocess.CalledProcessError, OSError) as e:
-            logging.warning("input text failed (%s), trying clipboard fallback", e)
+            safe_cmd = self._sanitize_cmd(['shell', 'input text <redacted>'])
+            logging.warning("input text failed (%s), trying clipboard fallback", safe_cmd)
             self._type_via_clipboard(text)
 
     def _type_via_clipboard(self, text: str) -> None:
@@ -151,6 +214,8 @@ class ADBClient:
             self.run(['shell', f'am broadcast -a clipper.set -e text {quoted}'], check=False)
             # KEYCODE_PASTE (279) attempts to paste into focused field
             self.run(['shell', 'input keyevent 279'], check=False)
+            # Clear the clipboard immediately to limit exposure to other apps.
+            self.run(['shell', 'am broadcast -a clipper.set -e text ""'], check=False)
             logging.info("Typed text via clipboard (length=%d, redacted)", len(text))
         except Exception as e:
             logging.error("Clipboard fallback also failed: %s", e)
@@ -171,6 +236,15 @@ class ADBClient:
         except ValueError:
             logging.error("Invalid screenshot path: %s", path)
             return False
+
+        # Reject symlinks and hardlinks to prevent arbitrary overwrites.
+        if target.exists():
+            if os.path.islink(str(target)) or os.lstat(str(target)).st_nlink != 1:
+                logging.error("Screenshot target is a symlink or hardlink: %s", path)
+                return False
+            if not os.path.isfile(str(target)):
+                logging.error("Screenshot target is not a regular file: %s", path)
+                return False
 
         remote_path = f"{_REMOTE_SCREENSHOT_DIR}/screen_{uuid.uuid4().hex}.png"
         try:

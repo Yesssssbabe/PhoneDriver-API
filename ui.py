@@ -11,11 +11,13 @@ import json
 import logging
 import os
 import re
+import stat
 import sys
 import tempfile
 import threading
+import time
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, List
 
 try:
     import fcntl
@@ -49,6 +51,24 @@ DEFAULT_STEP_DELAY = 1.5
 _device_lock = threading.Lock()
 _config_lock = threading.Lock()
 
+# Simple per-client rate limiter (token-bucket style).
+_rate_limit_lock = threading.Lock()
+_rate_limit_store: Dict[str, List[float]] = {}
+_MAX_REQUESTS_PER_WINDOW = 5
+_RATE_LIMIT_WINDOW_SECONDS = 60.0
+
+
+def _check_rate_limit(client: str = "default") -> bool:
+    """Return True if the request is within the rate limit."""
+    now = time.time()
+    with _rate_limit_lock:
+        window = [t for t in _rate_limit_store.get(client, []) if now - t < _RATE_LIMIT_WINDOW_SECONDS]
+        if len(window) >= _MAX_REQUESTS_PER_WINDOW:
+            return False
+        window.append(now)
+        _rate_limit_store[client] = window
+    return True
+
 
 # =============================================================================
 # Configuration I/O
@@ -76,8 +96,8 @@ def load_config() -> Dict[str, Any]:
 
 def save_config(config: Dict[str, Any]) -> None:
     """Save configuration to disk, stripping sensitive fields."""
-    safe_config = {k: v for k, v in config.items() if k != "api_key"}
     with _config_lock:
+        safe_config = {k: v for k, v in config.items() if k != "api_key"}
         fd, tmp_path = tempfile.mkstemp(dir=CONFIG_PATH.parent, suffix=".json")
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as f:
@@ -153,11 +173,16 @@ def _build_config(
     max_cycles: Any,
     step_delay: Any,
 ) -> Dict[str, Any]:
-    """Build a configuration dict for PhoneAgent."""
+    """Build a configuration dict for PhoneAgent.
+
+    SECURITY: the UI-supplied api_key is intentionally ignored; API keys must be
+    provided via environment variables to avoid leaking them through the Gradio
+    frontend/WebSocket payload.
+    """
     base = load_config()
 
     base["provider"] = provider
-    base["api_key"] = api_key
+    base["api_key"] = _resolve_api_key(provider, "")
     base["model"] = model
     base["temperature"] = float(temperature)
     base["max_tokens"] = int(max_tokens)
@@ -173,6 +198,13 @@ def _resolve_api_key(provider: str, ui_key: str) -> str:
     """Prefer environment variable API keys over UI-supplied keys."""
     env_var = API_KEY_ENV_MAP.get(provider, "API_KEY")
     env_key = os.environ.get(env_var) or os.environ.get("API_KEY", "")
+    # Best-effort removal from the process environment to reduce /proc exposure.
+    if env_var in os.environ:
+        del os.environ[env_var]
+        os.unsetenv(env_var)
+    if "API_KEY" in os.environ:
+        del os.environ["API_KEY"]
+        os.unsetenv("API_KEY")
     if env_key:
         return env_key
     return ui_key
@@ -213,6 +245,9 @@ def run_task(
     )
     if validation_error:
         return validation_error
+
+    if not _check_rate_limit():
+        return "Error: Rate limit exceeded. Please wait before submitting another task."
 
     config = _build_config(
         str(provider),
@@ -258,8 +293,8 @@ def build_ui() -> gr.Blocks:
 
                 api_key = gr.Textbox(
                     label="API Key",
-                    type="password",
-                    placeholder="Enter your API key",
+                    value="Set via environment variable",
+                    interactive=False,
                 )
 
                 model = gr.Textbox(
@@ -352,6 +387,9 @@ def build_ui() -> gr.Blocks:
             concurrency_limit=1,
         )
 
+        # Bound the Gradio queue to limit queue-based DoS.
+        demo.queue(max_size=10, default_concurrency_limit=1)
+
     return demo
 
 
@@ -361,9 +399,35 @@ def build_ui() -> gr.Blocks:
 demo = build_ui()
 
 
+def _validate_dotenv_permissions(dotenv_path: Path) -> None:
+    """Reject world-readable or world-writable .env files."""
+    if not dotenv_path.exists():
+        return
+    st = dotenv_path.stat()
+    if stat.S_IROTH & st.st_mode:
+        raise PermissionError(f".env file must not be world-readable: {dotenv_path}")
+    if stat.S_IWOTH & st.st_mode:
+        raise PermissionError(f".env file must not be world-writable: {dotenv_path}")
+
+
+def _require_non_root() -> None:
+    """Refuse to run as root unless explicitly allowed."""
+    if not hasattr(os, "geteuid"):
+        return
+    if os.geteuid() == 0 and os.environ.get("PHONEDRIVER_ALLOW_ROOT") != "1":
+        print(
+            "Running as root is not allowed. Set PHONEDRIVER_ALLOW_ROOT=1 to override.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+
 if __name__ == "__main__":
+    _require_non_root()
+
     # Load environment variables only at UI entry point
     dotenv_path = Path(__file__).resolve().parent / '.env'
+    _validate_dotenv_permissions(dotenv_path)
     if dotenv_path.exists():
         load_dotenv(dotenv_path=dotenv_path, override=False)
 
@@ -380,9 +444,20 @@ if __name__ == "__main__":
     auth_pass = os.environ.get("PHONEDRIVER_PASS")
     auth = (auth_user, auth_pass) if auth_user and auth_pass else None
 
+    ssl_keyfile = os.environ.get("PHONEDRIVER_SSL_KEYFILE") or None
+    ssl_certfile = os.environ.get("PHONEDRIVER_SSL_CERTFILE") or None
+    if not ssl_keyfile or not ssl_certfile:
+        logging.warning(
+            "SSL not configured. Consider setting PHONEDRIVER_SSL_KEYFILE and "
+            "PHONEDRIVER_SSL_CERTFILE for production use."
+        )
+
     demo.launch(
         server_name="127.0.0.1",
         server_port=int(os.environ.get("PHONEDRIVER_PORT", "7860")),
         show_api=False,
+        api_open=False,
         auth=auth,
+        ssl_keyfile=ssl_keyfile,
+        ssl_certfile=ssl_certfile,
     )

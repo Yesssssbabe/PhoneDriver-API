@@ -28,7 +28,7 @@ def register_provider(name: str):
             raise TypeError(
                 f"Provider {cls.__name__} must inherit from BaseProvider"
             )
-        _PROVIDER_MAP[name.lower()] = cls
+        _PROVIDER_MAP[name.casefold()] = cls
         return cls
 
     return decorator
@@ -36,7 +36,7 @@ def register_provider(name: str):
 
 def get_provider(provider_name: str, **kwargs: Any) -> BaseProvider:
     """Get provider instance by name."""
-    provider_class = _PROVIDER_MAP.get(provider_name.lower())
+    provider_class = _PROVIDER_MAP.get(provider_name.casefold())
     if not provider_class:
         raise ValueError(
             f"Unknown provider: {provider_name}. "
