@@ -1,6 +1,6 @@
 # Core dependencies (pinned to known-good versions)
 requests==2.32.3
-Pillow==12.2.0
+Pillow==12.3.0
 python-dotenv==1.1.0
 
 # Web UI
