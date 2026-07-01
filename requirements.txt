@@ -1,5 +1,5 @@
 # Core dependencies (pinned to known-good versions)
-requests==2.32.3
+requests==2.34.2
 Pillow==12.2.0
 python-dotenv==1.1.0
 
