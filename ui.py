@@ -238,8 +238,12 @@ def run_task(
     max_tokens: Any,
     max_cycles: Any,
     step_delay: Any,
+    consent: bool = False,
 ) -> str:
     """Gradio click handler."""
+    if not consent:
+        return "Error: You must consent to screen recording before running tasks."
+
     validation_error = _validate_inputs(
         task, temperature, max_tokens, max_cycles, step_delay
     )
@@ -344,6 +348,11 @@ def build_ui() -> gr.Blocks:
                     lines=3,
                 )
 
+                consent_checkbox = gr.Checkbox(
+                    label="I consent to screen recording and analysis by cloud AI models",
+                    value=False,
+                )
+
                 run_btn = gr.Button("Run Task", variant="primary")
 
                 output = gr.Textbox(
@@ -382,6 +391,7 @@ def build_ui() -> gr.Blocks:
                 max_tokens,
                 max_cycles,
                 step_delay,
+                consent_checkbox,
             ],
             outputs=output,
             concurrency_limit=1,

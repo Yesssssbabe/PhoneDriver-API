@@ -1,5 +1,7 @@
 """ADB client wrapper."""
 
+import concurrent.futures
+import hashlib
 import logging
 import os
 import re
@@ -31,9 +33,20 @@ _DEVICE_ID_RE = re.compile(r"^[A-Za-z0-9:_\-.]+$")
 class ADBClient:
     """Wrapper for ADB commands."""
 
-    def __init__(self, device_id: Optional[str] = None):
+    def __init__(
+        self,
+        device_id: Optional[str] = None,
+        trusted_fingerprint: str = "",
+    ):
         self.device_id = device_id
+        self._trusted_fingerprint = trusted_fingerprint
         self._lock = threading.Lock()
+        self._executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        self._validate_adb_keys()
+        if self._is_root() and os.environ.get("PHONEDRIVER_ALLOW_ADB_ROOT") != "1":
+            raise PermissionError(
+                "ADB is running in root mode. Set PHONEDRIVER_ALLOW_ADB_ROOT=1 to override."
+            )
 
     def _cmd(self, command: list) -> list:
         """Build ADB command with device ID if specified."""
@@ -65,7 +78,39 @@ class ADBClient:
         # Ensure a sane, minimal PATH so the real adb binary is found.
         if 'PATH' not in safe_env or not safe_env.get('PATH'):
             safe_env['PATH'] = '/usr/bin:/bin:/usr/local/bin'
+        # Remove world-writable directories from PATH to prevent binary hijacking.
+        path = safe_env.get('PATH', '')
+        safe_dirs = []
+        for d in path.split(':'):
+            if os.path.isdir(d):
+                try:
+                    st = os.stat(d)
+                    if stat.S_IWOTH & st.st_mode:
+                        logging.warning("World-writable PATH directory removed: %s", d)
+                        continue
+                except OSError:
+                    pass
+            safe_dirs.append(d)
+        safe_env['PATH'] = ':'.join(safe_dirs) or '/usr/bin:/bin'
         return safe_env
+
+    @staticmethod
+    def _validate_adb_keys() -> None:
+        """Validate that adb_keys file is not world-writable or owned by another user."""
+        home = os.environ.get('HOME', '')
+        if not home:
+            return
+        adb_keys = Path(home) / '.android' / 'adb_keys'
+        if not adb_keys.exists():
+            return
+        try:
+            st = adb_keys.stat()
+        except OSError:
+            return
+        if stat.S_IWOTH & st.st_mode:
+            raise PermissionError(f"adb_keys file is world-writable: {adb_keys}")
+        if st.st_uid != os.getuid():
+            raise PermissionError(f"adb_keys file is not owned by current user: {adb_keys}")
 
     @staticmethod
     def _sanitize_cmd(cmd: list) -> str:
@@ -76,19 +121,51 @@ class ADBClient:
             return '<ADB command containing sensitive text redacted>'
         return cmd_str
 
-    def run(self, command: list, check: bool = True, capture: bool = True, timeout: int = 30) -> Tuple[int, str, str]:
-        """Run ADB command and return result."""
+    def run(
+        self,
+        command: list,
+        check: bool = True,
+        capture: bool = True,
+        timeout: int = 30,
+        max_output_bytes: int = 1024 * 1024,
+    ) -> Tuple[int, str, str]:
+        """Run ADB command and return result.
+
+        Output is capped at ``max_output_bytes`` to avoid memory exhaustion from
+        unexpectedly large command output.
+        """
         with self._lock:
             cmd = self._cmd(command)
             safe_env = self._sanitize_env()
             try:
                 if capture:
-                    result = subprocess.run(
-                        cmd, check=check, capture_output=True, text=True,
-                        encoding='utf-8', errors='replace', timeout=timeout,
+                    proc = subprocess.Popen(
+                        cmd,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        text=True,
+                        encoding='utf-8',
+                        errors='replace',
                         env=safe_env,
                     )
-                    return result.returncode, result.stdout, result.stderr
+                    stdout_chunks = []
+                    total_size = 0
+                    while True:
+                        chunk = proc.stdout.read(4096)
+                        if not chunk:
+                            break
+                        total_size += len(chunk)
+                        if total_size > max_output_bytes:
+                            proc.kill()
+                            proc.wait()
+                            raise ValueError(f"ADB output exceeded {max_output_bytes} bytes")
+                        stdout_chunks.append(chunk)
+                    stdout = "".join(stdout_chunks)
+                    stderr = proc.stderr.read()[:1000]
+                    returncode = proc.wait()
+                    if check and returncode != 0:
+                        raise subprocess.CalledProcessError(returncode, cmd, stdout, stderr)
+                    return returncode, stdout, stderr
                 else:
                     result = subprocess.run(
                         cmd, check=check, timeout=timeout, env=safe_env,
@@ -108,6 +185,20 @@ class ADBClient:
                         e.returncode, safe_cmd, e.stdout, safe_stderr
                     ) from e
                 return e.returncode, e.stdout, e.stderr
+
+    def run_with_timeout(self, command: list, timeout: int = 30) -> Tuple[int, str, str]:
+        """Run ADB command with a hard timeout via future.cancel()."""
+        future = self._executor.submit(self.run, command, timeout=timeout)
+        try:
+            return future.result(timeout=timeout)
+        except concurrent.futures.TimeoutError:
+            future.cancel()
+            logging.error("ADB command forcefully timed out: %s", self._sanitize_cmd(command))
+            raise subprocess.TimeoutExpired(command, timeout)
+
+    def close(self) -> None:
+        """Release the executor used for hard timeouts."""
+        self._executor.shutdown(wait=False)
 
     def _shell(self, command: str) -> str:
         """Run an allowed ADB shell command.
@@ -179,9 +270,10 @@ class ADBClient:
     def type_text(self, text: str) -> None:
         """Type text via ADB.
 
-        Uses `input text` for ASCII input. Spaces are encoded as %s which is
-        the ADB convention. Non-ASCII characters (e.g. Chinese) may not work
-        with `input text`; a clipboard-based fallback is attempted.
+        Prefer `input text` for ASCII input to avoid global clipboard exposure.
+        Spaces are encoded as %s which is the ADB convention. Non-ASCII
+        characters fall back to the clipboard and the clipboard is cleared
+        afterwards.
         """
         if not text:
             return
@@ -201,21 +293,36 @@ class ADBClient:
             # Use stdin to avoid exposing text in the host process list.
             self._run_shell_input(f'input text {quoted}', check=True)
             logging.info("Typed text (length=%d, redacted)", len(text))
-        except (subprocess.CalledProcessError, OSError) as e:
+        except (subprocess.CalledProcessError, OSError, UnicodeEncodeError) as e:
             safe_cmd = self._sanitize_cmd(['shell', 'input text <redacted>'])
             logging.warning("input text failed (%s), trying clipboard fallback", safe_cmd)
             self._type_via_clipboard(text)
+        finally:
+            # Best-effort clear of the clipboard to limit exposure to other apps.
+            try:
+                self.run(['shell', 'am broadcast -a clipper.set -e text ""'], check=False)
+            except Exception:
+                pass
 
     def _type_via_clipboard(self, text: str) -> None:
-        """Fallback: type text using clipboard paste."""
+        """Fallback: type text using clipboard paste.
+
+        The text is escaped for Intent extras to reduce the risk of shell/Intent
+        injection through ``am broadcast``.
+        """
         try:
-            # Use shlex.quote for robust shell escaping instead of manual replacement
-            quoted = shlex.quote(text)
-            self.run(['shell', f'am broadcast -a clipper.set -e text {quoted}'], check=False)
+            # Escape backslashes and quotes, then escape non-printable characters.
+            safe_text = text.replace('\\', '\\\\').replace('"', '\\"').replace("'", "\\'")
+            safe_text = "".join(
+                c if c.isprintable() or c in '\t\n ' else '\\u' + format(ord(c), '04x')
+                for c in safe_text
+            )
+            self._run_shell_input(
+                f'am broadcast -a clipper.set -e text "{safe_text}"',
+                check=True,
+            )
             # KEYCODE_PASTE (279) attempts to paste into focused field
             self.run(['shell', 'input keyevent 279'], check=False)
-            # Clear the clipboard immediately to limit exposure to other apps.
-            self.run(['shell', 'am broadcast -a clipper.set -e text ""'], check=False)
             logging.info("Typed text via clipboard (length=%d, redacted)", len(text))
         except Exception as e:
             logging.error("Clipboard fallback also failed: %s", e)
@@ -292,8 +399,51 @@ class ADBClient:
             logging.error("Failed to get device ID: %s", e)
         return None
 
+    def get_current_window(self) -> str:
+        """Get current foreground window package name."""
+        try:
+            _, stdout, _ = self.run(['shell', 'dumpsys window | grep mCurrentFocus'])
+            match = re.search(r'([a-zA-Z0-9._]+)/', stdout)
+            return match.group(1) if match else ""
+        except Exception as exc:
+            logging.warning("Failed to get current window: %s", exc)
+            return ""
+
+    def _get_device_fingerprint(self) -> str:
+        """Get device build fingerprint."""
+        _, stdout, _ = self.run(['shell', 'getprop ro.build.fingerprint'])
+        return stdout.strip()
+
+    def verify_device(self) -> bool:
+        """Verify device fingerprint against a trusted value."""
+        if not self._trusted_fingerprint:
+            return True
+        actual = self._get_device_fingerprint()
+        expected_hash = hashlib.sha256(self._trusted_fingerprint.encode()).hexdigest()[:16]
+        actual_hash = hashlib.sha256(actual.encode()).hexdigest()[:16]
+        if expected_hash != actual_hash:
+            raise PermissionError("Device fingerprint mismatch.")
+        return True
+
+    def _is_tcp_device(self) -> bool:
+        """Return True if the configured device ID looks like a TCP endpoint."""
+        if not self.device_id:
+            return False
+        return ":" in self.device_id
+
+    def _is_root(self) -> bool:
+        """Return True if ADB shell is running as root (uid 0)."""
+        try:
+            _, stdout, _ = self.run(['shell', 'id -u'])
+            return stdout.strip() == "0"
+        except Exception:
+            return False
+
     def is_connected(self) -> bool:
-        """Check if device is connected."""
+        """Check if device is connected and authorized."""
+        if self._is_tcp_device() and os.environ.get("PHONEDRIVER_ALLOW_TCP") != "1":
+            logging.error("TCP ADB connection rejected. Set PHONEDRIVER_ALLOW_TCP=1.")
+            return False
         if self.device_id:
-            return self.get_device_id() == self.device_id
-        return self.get_device_id() is not None
+            return self.get_device_id() == self.device_id and self.verify_device()
+        return self.get_device_id() is not None and self.verify_device()

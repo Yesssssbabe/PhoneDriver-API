@@ -13,7 +13,7 @@ from unittest.mock import MagicMock
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from phone_agent import ActionExecutor, ConfigResolver, PhoneAgent
-from providers import available_providers, get_provider, register_provider
+from providers import FailoverProvider, available_providers, get_provider, register_provider
 from providers.base import BaseProvider, OpenAICompatibleProvider
 from providers.http_client import HttpClient
 
@@ -156,6 +156,18 @@ def test_phone_agent_wires_components():
     assert hasattr(agent, "_orchestrator")
     assert hasattr(agent, "config")
     assert agent.config["provider"] == "openai"
+
+
+def test_failover_provider_tries_next_on_failure():
+    """NF-10: FailoverProvider routes to the next provider on failure."""
+    good = DummyProvider()
+    bad = DummyProvider()
+    bad.analyze_screenshot = MagicMock(side_effect=RuntimeError("provider down"))
+
+    failover = FailoverProvider([bad, good])
+    result = failover.analyze_screenshot("path", "task", {})
+    assert result == {"action": "terminate", "message": "done"}
+    bad.analyze_screenshot.assert_called_once()
 
 
 if __name__ == "__main__":

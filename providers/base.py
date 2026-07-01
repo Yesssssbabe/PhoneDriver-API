@@ -7,6 +7,8 @@ delegates the actual HTTP work to an injectable :class:`HttpClient`.
 from __future__ import annotations
 
 import base64
+import hashlib
+import hmac
 import json
 import logging
 import os
@@ -115,6 +117,8 @@ class OpenAICompatibleProvider(BaseProvider):
         headers: Optional[Dict[str, str]] = None,
         http_client: Optional[HttpClient] = None,
         training_opt_out: bool = True,
+        response_hmac_key: str = "",
+        pinned_cert: str = "",
     ):
         self.api_key = _sanitize_header_value(str(api_key))
         self.model = model or self.default_model
@@ -122,6 +126,7 @@ class OpenAICompatibleProvider(BaseProvider):
         self.max_tokens = max_tokens
         self.max_retries = max_retries
         self.training_opt_out = training_opt_out
+        self._response_hmac_key = response_hmac_key
         self.system_prompt = self._get_system_prompt()
 
         if headers:
@@ -133,6 +138,7 @@ class OpenAICompatibleProvider(BaseProvider):
             self._client = OpenAICompatibleClient(
                 base_url=base_url,
                 headers=headers or {},
+                pinned_cert=pinned_cert,
             )
 
         # Image cache disabled by default to avoid timing side-channels and
@@ -148,6 +154,19 @@ class OpenAICompatibleProvider(BaseProvider):
     def _get_system_prompt(self) -> str:
         """Return the system prompt. Subclasses may override for customization."""
         return self.DEFAULT_SYSTEM_PROMPT
+
+    def _verify_response(self, response_body: bytes, signature_header: str) -> bool:
+        """Verify HMAC-SHA256 signature from provider, if configured."""
+        if not self._response_hmac_key:
+            return True
+        if not response_body or not signature_header:
+            return False
+        expected = hmac.new(
+            self._response_hmac_key.encode(),
+            response_body,
+            hashlib.sha256,
+        ).hexdigest()
+        return hmac.compare_digest(expected, signature_header)
 
     @staticmethod
     def _sanitize_user_request(user_request: str) -> str:
@@ -266,6 +285,12 @@ class OpenAICompatibleProvider(BaseProvider):
             )
             if content is None:
                 return None
+            # Verify response integrity when a shared HMAC key is configured.
+            if hasattr(self._client, 'last_response_raw') and hasattr(self._client, 'last_response_headers'):
+                signature = self._client.last_response_headers.get("X-Response-Signature", "")
+                if not self._verify_response(self._client.last_response_raw, signature):
+                    logging.error("Response HMAC verification failed")
+                    return None
             return self._parse_response(content)
         finally:
             del base64_image

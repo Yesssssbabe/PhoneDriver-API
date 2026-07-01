@@ -3,6 +3,7 @@
 import logging
 import os
 import stat
+import sys
 import tempfile
 import threading
 import uuid
@@ -23,6 +24,32 @@ Image.MAX_IMAGE_PIXELS = 10_000_000
 DEFAULT_SAVE_DIR = "./screenshots"
 
 
+# Packages that commonly display sensitive information (banking, messaging).
+_SENSITIVE_PACKAGES = {
+    "com.android.bank",
+    "com.tencent.mm",
+    "com.eg.android.AlipayGphone",
+    "com.google.android.apps.messaging",
+    "com.android.messaging",
+    "com.whatsapp",
+    "com.facebook.orca",
+}
+
+
+def _is_junction(path: Path) -> bool:
+    """Detect Windows junction points / reparse points."""
+    if sys.platform != "win32":
+        return False
+    try:
+        import ctypes
+        FILE_ATTRIBUTE_REPARSE_POINT = 0x400
+        kernel32 = ctypes.windll.kernel32
+        attrs = kernel32.GetFileAttributesW(ctypes.c_wchar_p(str(path)))
+        return attrs != 0xFFFFFFFF and (attrs & FILE_ATTRIBUTE_REPARSE_POINT) != 0
+    except Exception:
+        return False
+
+
 def _validate_save_dir(save_dir: Path) -> Path:
     """Resolve save_dir and ensure it is within the allowed base directory."""
     resolved = save_dir.resolve()
@@ -31,6 +58,8 @@ def _validate_save_dir(save_dir: Path) -> Path:
         resolved.relative_to(allowed_base)
     except ValueError as exc:
         raise ValueError(f"Invalid screenshot directory: {save_dir}") from exc
+    if _is_junction(resolved):
+        raise ValueError(f"Junction point not allowed: {save_dir}")
     return resolved
 
 
@@ -46,9 +75,15 @@ def _sanitize_filename(name: str) -> str:
 class ScreenshotCapture:
     """Handle screenshot capture and management."""
 
-    def __init__(self, adb: ADBClient, save_dir: str = DEFAULT_SAVE_DIR):
+    def __init__(
+        self,
+        adb: ADBClient,
+        save_dir: str = DEFAULT_SAVE_DIR,
+        sensitive_app_whitelist: Optional[list] = None,
+    ):
         self.adb = adb
         self.save_dir = _validate_save_dir(Path(save_dir))
+        self._sensitive_app_whitelist = set(sensitive_app_whitelist or [])
 
         # Reject symlinked directories to prevent arbitrary file writes
         if self.save_dir.is_symlink():
@@ -122,6 +157,25 @@ class ScreenshotCapture:
             os.close(fd)
             raise
 
+    def _strip_notification_bar(self, img: Image.Image) -> Image.Image:
+        """Crop the top notification bar out of the screenshot."""
+        width, height = img.size
+        notification_height = min(100, height // 10)
+        if notification_height >= height:
+            return img
+        return img.crop((0, notification_height, width, height))
+
+    def _check_sensitive_app(self) -> None:
+        """Raise PermissionError if the foreground app is sensitive."""
+        current_pkg = self.adb.get_current_window()
+        if not current_pkg:
+            return
+        if current_pkg in self._sensitive_app_whitelist:
+            return
+        if any(pkg in current_pkg for pkg in _SENSITIVE_PACKAGES):
+            logging.error("Sensitive app detected on screen: %s. Skipping screenshot.", current_pkg)
+            raise PermissionError(f"Cannot capture screenshot of sensitive app: {current_pkg}")
+
     def capture_with_resize(self, max_size: int = 1280) -> Optional[str]:
         """Capture and resize screenshot."""
         if not isinstance(max_size, int) or max_size < 1:
@@ -129,6 +183,8 @@ class ScreenshotCapture:
             max_size = 1280
 
         with self._lock:
+            self._check_sensitive_app()
+
             path = self.capture()
             if not path:
                 return None
@@ -152,27 +208,29 @@ class ScreenshotCapture:
                             logging.error("Screenshot dimensions too large: %dx%d", width, height)
                             return None
 
-                        if original_max <= max_size:
-                            return path  # Skip unnecessary work
-                        ratio = max_size / original_max
-                        new_size = tuple(int(dim * ratio) for dim in img.size)
-                        # Use BICUBIC for a good balance of speed and quality
-                        img_resized = img.resize(new_size, Image.Resampling.BICUBIC)
+                        # Strip the notification bar to reduce OTP/SMS exposure.
+                        img = self._strip_notification_bar(img)
+
+                        if original_max > max_size:
+                            ratio = max_size / original_max
+                            new_size = tuple(int(dim * ratio) for dim in img.size)
+                            # Use BICUBIC for a good balance of speed and quality
+                            img = img.resize(new_size, Image.Resampling.BICUBIC)
 
                         # Create a uniquely-named temp file with restrictive permissions.
                         fd, temp_path = tempfile.mkstemp(dir=self.save_dir, suffix=".tmp")
                         os.close(fd)
                         os.chmod(temp_path, 0o600)
                         try:
-                            img_resized.save(temp_path, optimize=False)
+                            img.save(temp_path, optimize=False)
                             # Reject if the destination became a hardlink.
                             if os.path.exists(path) and os.lstat(path).st_nlink > 1:
                                 logging.error("Hardlink detected, refusing to replace: %s", path)
                                 return None
                             os.replace(temp_path, path)
-                            logging.info("Resized screenshot to %s", new_size)
+                            if original_max > max_size:
+                                logging.info("Resized screenshot to %s", new_size)
                         finally:
-                            img_resized.close()
                             try:
                                 if os.path.exists(temp_path):
                                     os.unlink(temp_path)

@@ -6,6 +6,7 @@ existing file needs to be edited.
 """
 from __future__ import annotations
 
+import logging
 from typing import Any, Dict, List, Type
 
 from .base import BaseProvider, OpenAICompatibleProvider
@@ -32,6 +33,48 @@ def register_provider(name: str):
         return cls
 
     return decorator
+
+
+class FailoverProvider(BaseProvider):
+    """Wrap multiple providers and fail over on error."""
+
+    def __init__(self, providers: List[BaseProvider]):
+        self.providers = providers
+        self._current = 0
+
+    def analyze_screenshot(
+        self,
+        screenshot_path: str,
+        user_request: str,
+        context: Optional[Dict[str, Any]] = None,
+    ) -> Optional[Dict[str, Any]]:
+        for i in range(len(self.providers)):
+            provider = self.providers[(self._current + i) % len(self.providers)]
+            try:
+                result = provider.analyze_screenshot(screenshot_path, user_request, context)
+                if result:
+                    self._current = (self._current + i) % len(self.providers)
+                    return result
+            except Exception as exc:
+                logging.warning("Provider %d failed: %s", i, exc)
+        return None
+
+    def check_task_completion(
+        self,
+        screenshot_path: str,
+        user_request: str,
+        context: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        for i in range(len(self.providers)):
+            provider = self.providers[(self._current + i) % len(self.providers)]
+            try:
+                result = provider.check_task_completion(screenshot_path, user_request, context)
+                if result and result.get("complete"):
+                    self._current = (self._current + i) % len(self.providers)
+                    return result
+            except Exception as exc:
+                logging.warning("Provider %d failed: %s", i, exc)
+        return {"complete": False, "reason": "All providers failed", "confidence": 0.0}
 
 
 def get_provider(provider_name: str, **kwargs: Any) -> BaseProvider:
@@ -66,6 +109,7 @@ from .openrouter import OpenRouterProvider
 __all__ = [
     "BaseProvider",
     "OpenAICompatibleProvider",
+    "FailoverProvider",
     "register_provider",
     "get_provider",
     "available_providers",

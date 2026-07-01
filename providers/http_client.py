@@ -102,19 +102,33 @@ class HttpClient(ABC):
 class OpenAICompatibleClient(HttpClient):
     """HTTP client for OpenAI-compatible ``/chat/completions`` endpoints."""
 
+    _MODEL_PRICING = {
+        "gpt-4o": {"input": 0.005, "output": 0.015},
+        "kimi-for-coding": {"input": 0.003, "output": 0.009},
+        "kimi-k2.5": {"input": 0.003, "output": 0.009},
+        "moonshotai/kimi-k2.5": {"input": 0.003, "output": 0.009},
+    }
+
     def __init__(
         self,
         base_url: str,
         headers: Optional[Dict[str, str]] = None,
         session: Optional[requests.Session] = None,
+        pinned_cert: str = "",
     ):
         self.base_url = base_url.rstrip("/")
         self.headers = headers or {}
         self.session = session or requests.Session()
-        self.session.verify = True
+        if pinned_cert:
+            self.session.verify = pinned_cert
+        else:
+            self.session.verify = True
         self.circuit_breaker = CircuitBreaker()
         self._session_lock = threading.Lock()
         self._closing = False
+        self._cost_tracker = {"total_tokens": 0, "total_cost_usd": 0.0}
+        self.last_response_headers: Dict[str, str] = {}
+        self.last_response_raw: bytes = b""
 
     def close(self) -> None:
         """Close the requests session and release connections."""
@@ -200,6 +214,7 @@ class OpenAICompatibleClient(HttpClient):
                         return None
 
                     resp.raise_for_status()
+                    self.last_response_headers = dict(resp.headers)
 
                     content_type = resp.headers.get("Content-Type", "")
                     if "application/json" not in content_type:
@@ -208,12 +223,27 @@ class OpenAICompatibleClient(HttpClient):
                         return None
 
                     raw = resp.raw.read(MAX_RESPONSE_BYTES + 1)
+                    self.last_response_raw = raw
                     if len(raw) > MAX_RESPONSE_BYTES:
                         logging.error("Response body too large: %d bytes", len(raw))
                         self.circuit_breaker.record_failure()
                         return None
 
                     data = json.loads(raw)
+                    usage = data.get("usage", {})
+                    prompt_tokens = usage.get("prompt_tokens", 0)
+                    completion_tokens = usage.get("completion_tokens", 0)
+                    total_tokens = usage.get("total_tokens", prompt_tokens + completion_tokens)
+                    self._cost_tracker["total_tokens"] += total_tokens
+                    pricing = self._MODEL_PRICING.get(model, {"input": 0.01, "output": 0.03})
+                    cost = (prompt_tokens / 1000) * pricing["input"] + (completion_tokens / 1000) * pricing["output"]
+                    self._cost_tracker["total_cost_usd"] += cost
+                    logging.info(
+                        "API call cost: $%.4f, total: $%.4f",
+                        cost,
+                        self._cost_tracker["total_cost_usd"],
+                    )
+
                     choices = data.get("choices", [])
                     if not isinstance(choices, list) or not choices:
                         logging.error("Invalid or empty choices in API response")

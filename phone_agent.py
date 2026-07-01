@@ -23,6 +23,7 @@ import json
 import logging
 import math
 import os
+import random
 import re
 import stat
 import subprocess
@@ -180,10 +181,70 @@ class ActionValidationError(Exception):
 
 
 # =============================================================================
+# Output safety checker
+# =============================================================================
+class OutputSafetyChecker:
+    """Semantic filter for dangerous model outputs."""
+
+    DANGEROUS_PATTERNS = [
+        re.compile(r"(?i)(delete|erase|wipe|factory.reset|uninstall.all)"),
+        re.compile(r"(?i)(send.sms|dial|call.emergency)"),
+        re.compile(r"(?i)(open.settings|change.password|disable.security)"),
+    ]
+
+    def check(self, action: Dict[str, Any]) -> bool:
+        text = json.dumps(action)
+        for pattern in self.DANGEROUS_PATTERNS:
+            if pattern.search(text):
+                logging.warning("Dangerous action detected: %s", action)
+                return False
+        return True
+
+
+# =============================================================================
+# API key manager
+# =============================================================================
+class APIKeyManager:
+    """Simple key rotator with optional scope filtering."""
+
+    def __init__(self, keys: List[str], scopes: Optional[Dict[str, List[str]]] = None):
+        self.keys = keys
+        self.scopes = scopes or {}
+        self._current = 0
+
+    def get_key(self, scope: str = "default") -> str:
+        allowed = self.scopes.get(scope, [])
+        for _ in range(len(self.keys)):
+            key = self.keys[self._current % len(self.keys)]
+            self._current += 1
+            if not allowed or scope in allowed:
+                return key
+        raise ValueError(f"No key available for scope: {scope}")
+
+
+# =============================================================================
 # ConfigResolver
 # =============================================================================
 class ConfigResolver:
     """Resolve and coerce configuration from a dict and optional env fallback."""
+
+    _PROVIDER_COMPLIANCE = {
+        "openai": {"store": False, "training_opt_out": True, "dpa_required": False},
+        "openrouter": {"training_opt_out": True, "dpa_required": False},
+        "kimi_code": {"training_opt_out": True, "dpa_required": True},
+        "moonshot": {"training_opt_out": True, "dpa_required": True},
+    }
+
+    _RESIDENCY_ENDPOINTS = {
+        "us": {
+            "openai": "https://api.openai.com",
+            "moonshot": "https://api.moonshot.cn",
+        },
+        "eu": {
+            "openai": "https://api.openai.com",
+            "moonshot": "https://eu.api.moonshot.cn",
+        },
+    }
 
     def __init__(self, config: Dict[str, Any], use_env_fallback: bool = True):
         self.config = config or {}
@@ -217,6 +278,11 @@ class ConfigResolver:
         cfg["check_completion"] = bool(cfg.get("check_completion", True))
         cfg["auto_detect_resolution"] = bool(cfg.get("auto_detect_resolution", True))
         cfg.setdefault("max_api_calls", DEFAULT_MAX_API_CALLS)
+        cfg.setdefault("max_budget_usd", 10.0)
+        cfg.setdefault("data_residency", "us")
+        cfg.setdefault("dpa_accepted", False)
+        cfg.setdefault("device_fingerprint", "")
+        cfg.setdefault("sensitive_app_whitelist", [])
 
         screenshot_dir = cfg.get("screenshot_dir", "./screenshots")
         screenshot_path = Path(screenshot_dir).resolve()
@@ -230,7 +296,22 @@ class ConfigResolver:
         cfg.setdefault("screen_width", DEFAULT_SCREEN_WIDTH)
         cfg.setdefault("screen_height", DEFAULT_SCREEN_HEIGHT)
 
+        # Provider compliance matrix (DPA / training opt-out).
+        cfg["compliance"] = self._resolve_compliance(provider, cfg)
+
+        # Data residency: validate and optionally override endpoint.
+        residency = cfg.get("data_residency", "us")
+        if residency not in self._RESIDENCY_ENDPOINTS:
+            cfg["data_residency"] = "us"
+        cfg["provider_base_url"] = self._RESIDENCY_ENDPOINTS.get(residency, {}).get(provider, "")
+
         return cfg
+
+    def _resolve_compliance(self, provider: str, cfg: Dict[str, Any]) -> Dict[str, Any]:
+        compliance = self._PROVIDER_COMPLIANCE.get(provider, {})
+        if compliance.get("dpa_required") and not cfg.get("dpa_accepted"):
+            raise ValueError(f"Provider {provider} requires DPA acceptance.")
+        return compliance
 
     def _resolve_provider(self, cfg: Dict[str, Any]) -> str:
         if cfg.get("provider"):
@@ -467,6 +548,7 @@ class TaskOrchestrator:
         self.check_completion = config["check_completion"]
         self.max_history = config["max_history"]
         self.max_api_calls = max(1, int(config.get("max_api_calls", DEFAULT_MAX_API_CALLS)))
+        self.max_budget_usd = float(config.get("max_budget_usd", 10.0))
         self._api_calls = 0
         self._per_cycle_timeout = float(config.get("per_cycle_timeout_seconds", 45.0))
         self.previous_actions: List[Dict[str, Any]] = []
@@ -474,6 +556,11 @@ class TaskOrchestrator:
             adb, (config["screen_width"], config["screen_height"])
         )
         self._validator = ActionValidator()
+        self._safety_checker = OutputSafetyChecker()
+        self._key_manager: Optional[APIKeyManager] = None
+        keys = config.get("api_keys")
+        if isinstance(keys, list) and keys:
+            self._key_manager = APIKeyManager(keys, config.get("api_key_scopes", {}))
 
     # Dangerous task keywords that require explicit operator override.
     _DANGEROUS_KEYWORDS = {"factory reset", "erase all", "uninstall all", "wipe data"}
@@ -504,6 +591,9 @@ class TaskOrchestrator:
 
                 if self._api_calls + calls_per_cycle > self.max_api_calls:
                     return {"success": False, "message": "Budget exceeded (max_api_calls)"}
+
+                if self._check_budget_exceeded():
+                    return {"success": False, "message": f"Budget exceeded (${self.max_budget_usd} USD)"}
 
                 if not self.adb.is_connected():
                     logging.error("Device disconnected")
@@ -540,6 +630,8 @@ class TaskOrchestrator:
                     return {"success": False, "message": "Per-cycle timeout exceeded"}
 
                 self._validator.validate(action)
+                if not self._safety_checker.check(action):
+                    return {"success": False, "message": "Action blocked by safety checker"}
                 self._record_action(action)
                 if self._detect_action_loop():
                     return {"success": False, "message": "Action loop detected"}
@@ -553,7 +645,9 @@ class TaskOrchestrator:
                 if not should_continue:
                     return {"success": True, "message": "Task completed"}
 
-                time.sleep(self.step_delay)
+                # Add small random jitter to step_delay to mitigate timing side-channels.
+                jitter = random.uniform(0, self.step_delay * 0.1) if self.step_delay > 0 else 0.0
+                time.sleep(self.step_delay + jitter)
 
                 # Periodic cleanup to avoid unbounded disk use during long tasks.
                 if cycle % 10 == 0:
@@ -568,6 +662,13 @@ class TaskOrchestrator:
             }
         finally:
             self.screenshot.cleanup_old(keep_count=50)
+
+    def _check_budget_exceeded(self) -> bool:
+        """Check whether the configured USD budget has been exceeded."""
+        client = getattr(self.provider, "_client", None)
+        if client is None or not hasattr(client, "_cost_tracker"):
+            return False
+        return client._cost_tracker.get("total_cost_usd", 0.0) > self.max_budget_usd
 
     def _execute_action(self, action: Dict[str, Any]) -> bool:
         return self.executor.execute(action)
@@ -617,8 +718,14 @@ class PhoneAgent:
         resolver = ConfigResolver(config)
         self.config = resolver.resolve()
 
-        self.adb = ADBClient()
-        self.screenshot = ScreenshotCapture(self.adb, self.config["screenshot_dir"])
+        self.adb = ADBClient(
+            trusted_fingerprint=self.config.get("device_fingerprint", ""),
+        )
+        self.screenshot = ScreenshotCapture(
+            self.adb,
+            self.config["screenshot_dir"],
+            sensitive_app_whitelist=self.config.get("sensitive_app_whitelist"),
+        )
         self.vl_agent = self._create_provider()
         # Let the provider coordinate screenshot read references with cleanup.
         self.vl_agent._screenshot_capture = self.screenshot
@@ -674,6 +781,11 @@ class PhoneAgent:
                 self.vl_agent.close()
             except Exception as exc:
                 logging.warning("Provider cleanup failed: %s", exc)
+
+        try:
+            self.adb.close()
+        except Exception as exc:
+            logging.warning("ADB cleanup failed: %s", exc)
 
         try:
             self.screenshot.cleanup_old(keep_count=50)
