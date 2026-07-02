@@ -9,7 +9,7 @@
   "max_tokens": 512,
   "auto_detect_resolution": true,
 
-  "_security_field_comments": {
+  "security_field_comments": {
     "max_budget_usd": "Maximum total USD spend before tasks are stopped (budget guardrail).",
     "dpa_accepted": "Whether the user has accepted the Data Processing Agreement for providers that require it.",
     "device_fingerprint": "Expected ADB device fingerprint; tasks abort if the connected device does not match.",

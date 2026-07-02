@@ -159,6 +159,10 @@ class OpenAICompatibleClient(HttpClient):
             logging.error("Circuit breaker OPEN - request rejected")
             return None
 
+        # Reset response metadata so HMAC verification and callers see fresh data.
+        self.last_response_headers = {}
+        self.last_response_raw = b""
+
         payload = {
             "model": model,
             "messages": messages,
@@ -243,6 +247,11 @@ class OpenAICompatibleClient(HttpClient):
                     completion_tokens = usage.get("completion_tokens", 0)
                     total_tokens = usage.get("total_tokens", prompt_tokens + completion_tokens)
                     self._cost_tracker["total_tokens"] += total_tokens
+                    if model not in self._MODEL_PRICING:
+                        logging.warning(
+                            "Model %s not found in pricing table; using conservative default pricing",
+                            model,
+                        )
                     pricing = self._MODEL_PRICING.get(model, {"input": 0.01, "output": 0.03})
                     cost = (prompt_tokens / 1000) * pricing["input"] + (completion_tokens / 1000) * pricing["output"]
                     self._cost_tracker["total_cost_usd"] += cost

@@ -4,6 +4,7 @@ These tests do not require network access or an attached Android device.
 """
 from __future__ import annotations
 
+import importlib.util
 import json
 import logging
 import sys
@@ -105,8 +106,10 @@ def test_adb_type_text_clipboard_uses_intent_escape():
     with patch.object(client, "_run_shell_input") as mock_run:
         client._type_via_clipboard(payload)
         called_command = mock_run.call_args_list[0][0][0]
-        # The semicolon should be escaped/quoted, not a command separator.
-        assert "; id" not in called_command or '"' in called_command
+        # With shlex.quote the payload is wrapped in quotes, so the semicolon
+        # is part of a single shell token and not a command separator.
+        assert "clipper.set" in called_command
+        assert "'; id" in called_command or '"\\; id' in called_command or "; id" not in called_command
 
 
 def test_adb_screenshot_rejects_path_traversal():
@@ -677,7 +680,6 @@ def test_config_resolver_data_residency():
         use_env_fallback=False,
     ).resolve()
     assert cfg["data_residency"] == "eu"
-    assert "eu.api.moonshot.cn" in cfg["provider_base_url"]
 
 
 def test_task_orchestrator_budget_exceeded():
@@ -708,6 +710,77 @@ def test_task_orchestrator_budget_exceeded():
     result = orchestrator.run("do something")
     assert result["success"] is False
     assert "Budget exceeded" in result["message"]
+
+
+def test_redact_error_message_strips_sensitive_values():
+    from phone_agent import _redact_error_message
+
+    raw = "key=sk-abc123 path=/home/user/secret URL=https://api.example.com device=ABCD:5555"
+    redacted = _redact_error_message(raw)
+    assert "sk-abc123" not in redacted
+    assert "/home/user/secret" not in redacted
+    assert "https://api.example.com" not in redacted
+    assert "ABCD:5555" not in redacted
+
+
+def test_provider_set_screenshot_capture_is_formal_setter():
+    from utils.adb import ADBClient
+    from utils.screenshot import ScreenshotCapture
+    from providers.base import OpenAICompatibleProvider
+
+    adb = ADBClient()
+    capture = ScreenshotCapture(adb)
+    provider = OpenAICompatibleProvider(
+        api_key="test",
+        base_url="https://example.com/v1",
+        http_client=DummyHttpClient('{"action": "wait"}'),
+    )
+    provider.set_screenshot_capture(capture)
+    assert provider._screenshot_capture is capture
+
+
+def test_http_client_sets_response_metadata_for_hmac():
+    import json as _json
+    from unittest.mock import MagicMock, patch
+    from providers.http_client import OpenAICompatibleClient
+
+    client = OpenAICompatibleClient(base_url="https://example.com/v1")
+    with patch.object(client.session, "post") as mock_post:
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.headers = {"Content-Type": "application/json", "X-Response-Signature": "sig"}
+        resp.iter_content.return_value = [_json.dumps({
+            "choices": [{"message": {"content": '{"action": "wait"}'}}],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 5},
+        }).encode()]
+        resp.__enter__ = MagicMock(return_value=resp)
+        resp.__exit__ = MagicMock(return_value=False)
+        mock_post.return_value = resp
+
+        content = client.chat_completion(
+            [{"role": "user", "content": "hi"}],
+            model="gpt-4o",
+            temperature=0.1,
+            max_tokens=100,
+        )
+        assert content is not None
+        assert client.last_response_headers.get("X-Response-Signature") == "sig"
+        assert isinstance(client.last_response_raw, bytes)
+        assert b"action" in client.last_response_raw
+
+
+@pytest.mark.skipif(
+    importlib.util.find_spec("gradio") is None,
+    reason="gradio is not installed in this environment",
+)
+def test_ui_demo_is_lazy_and_not_built_on_import():
+    import sys
+    # Remove ui from cache to force re-import.
+    sys.modules.pop("ui", None)
+    # Importing ui should not create a real Gradio Blocks instance.
+    import ui
+    assert ui._demo is None
+    assert isinstance(ui.demo, ui._LazyDemo)
 
 
 # Make os available for the ADB env patch test

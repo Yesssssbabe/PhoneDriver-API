@@ -346,22 +346,12 @@ class ADBClient:
     def _type_via_clipboard(self, text: str) -> None:
         """Fallback: type text using clipboard paste.
 
-        The text is escaped so the shell does not interpret metacharacters such
-        as ``$``, ``;``, or backticks, preventing shell/Intent injection through
-        ``am broadcast``. Semicolons are forced into a double-quoted token so
-        they cannot be parsed as command separators.
+        The text is escaped with shlex.quote() so the shell does not interpret
+        metacharacters such as ``$``, ``;``, or backticks, preventing shell/Intent
+        injection through ``am broadcast``.
         """
         try:
             quoted = shlex.quote(text)
-            if ';' in quoted:
-                # Escape characters that retain special meaning inside double quotes.
-                escaped = (
-                    text.replace('\\', '\\\\')
-                    .replace('"', '\\"')
-                    .replace('`', '\\`')
-                    .replace('$', '\\$')
-                )
-                quoted = f'"{escaped}"'
             self._run_shell_input(
                 f'am broadcast -a clipper.set -e text {quoted}',
                 check=True,
@@ -447,9 +437,18 @@ class ADBClient:
     def get_current_window(self) -> str:
         """Get current foreground window package name."""
         try:
-            _, stdout, _ = self.run(['shell', 'dumpsys window | grep mCurrentFocus'])
-            match = re.search(r'([a-zA-Z0-9._]+)/', stdout)
-            return match.group(1) if match else ""
+            _, stdout, _ = self.run(['shell', 'dumpsys window | grep -E "mCurrentFocus|mFocusedWindow"'])
+            # Try several common output formats to be robust across Android versions.
+            patterns = [
+                r'mCurrentFocus=Window\{[^}]*\s+u?\d+\s+([^/\s]+)/',
+                r'mFocusedWindow=Window\{[^}]*\s+u?\d+\s+([^/\s]+)/',
+                r'([a-zA-Z0-9._]+)/[a-zA-Z0-9._]+',
+            ]
+            for pattern in patterns:
+                match = re.search(pattern, stdout)
+                if match:
+                    return match.group(1)
+            return ""
         except Exception as exc:
             logging.warning("Failed to get current window: %s", exc)
             return ""

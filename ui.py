@@ -17,7 +17,7 @@ import tempfile
 import threading
 import time
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 try:
     import fcntl
@@ -189,7 +189,8 @@ def _build_config(
     base = load_config()
 
     base["provider"] = provider
-    base["api_key"] = _resolve_api_key(provider, "")
+    # UI-supplied api_key is ignored per security policy.
+    base["api_key"] = _resolve_api_key(provider)
     base["model"] = model
     base["temperature"] = float(temperature)
     base["max_tokens"] = int(max_tokens)
@@ -201,8 +202,12 @@ def _build_config(
     return base
 
 
-def _resolve_api_key(provider: str, ui_key: str) -> str:
-    """Prefer environment variable API keys over UI-supplied keys."""
+def _resolve_api_key(provider: str) -> str:
+    """Read the API key from environment variables only.
+
+    UI-supplied keys are never used. The corresponding environment variables
+    are removed from the process environment after reading.
+    """
     env_var = API_KEY_ENV_MAP.get(provider, "API_KEY")
     env_key = os.environ.get(env_var) or os.environ.get("API_KEY", "")
     # Best-effort removal from the process environment to reduce /proc exposure.
@@ -212,9 +217,7 @@ def _resolve_api_key(provider: str, ui_key: str) -> str:
     if "API_KEY" in os.environ:
         del os.environ["API_KEY"]
         os.unsetenv("API_KEY")
-    if env_key:
-        return env_key
-    return ui_key
+    return env_key
 
 
 # =============================================================================
@@ -222,7 +225,7 @@ def _resolve_api_key(provider: str, ui_key: str) -> str:
 # =============================================================================
 def _execute_task(config: Dict[str, Any], task: str) -> str:
     """Instantiate PhoneAgent and execute the task."""
-    config["api_key"] = _resolve_api_key(config.get("provider", ""), config.get("api_key", ""))
+    config["api_key"] = _resolve_api_key(config.get("provider", ""))
     agent = PhoneAgent(config)
     try:
         result = agent.execute_task(task)
@@ -276,7 +279,7 @@ def run_task(
     try:
         return _execute_task(config, str(task))
     except Exception as exc:
-        safe_msg = re.sub(r"key=[a-zA-Z0-9_\-\.]+", "key=<REDACTED>", str(exc))
+        safe_msg = _redact_error_message(str(exc))
         logger.error("Task execution failed: %s", safe_msg)
         return f"Error: {type(exc).__name__}: {safe_msg}"
     finally:
@@ -411,9 +414,30 @@ def build_ui() -> gr.Blocks:
 
 
 # =============================================================================
-# Module-level UI (kept for backward compatibility, built lazily via factory)
+# Module-level UI (lazy-loaded to avoid Gradio overhead on import)
 # =============================================================================
-demo = build_ui()
+_demo: Optional[gr.Blocks] = None
+
+
+class _LazyDemo:
+    """Backward-compatible lazy wrapper around the Gradio Blocks UI."""
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(_get_demo(), name)
+
+    def launch(self, *args: Any, **kwargs: Any) -> Any:
+        return _get_demo().launch(*args, **kwargs)
+
+
+def _get_demo() -> gr.Blocks:
+    """Build and cache the Gradio UI on first use."""
+    global _demo
+    if _demo is None:
+        _demo = build_ui()
+    return _demo
+
+
+demo = _LazyDemo()
 
 
 def _validate_dotenv_permissions(dotenv_path: Path) -> None:
@@ -437,6 +461,17 @@ def _require_non_root() -> None:
             file=sys.stderr,
         )
         sys.exit(1)
+
+
+def _redact_error_message(message: str) -> str:
+    """Redact sensitive values from exception messages shown to users."""
+    safe = re.sub(r"key=[a-zA-Z0-9_\-\.]+", "key=<REDACTED>", message)
+    safe = re.sub(r"(?i)sk-[a-zA-Z0-9]{20,}", "<API_KEY_REDACTED>", safe)
+    safe = re.sub(r"https?://[^\s\"']+", "<URL>", safe)
+    safe = re.sub(r"(/[a-zA-Z0-9_\-\.]+)+", "<PATH>", safe)
+    # Redact likely ADB device identifiers (alphanumeric, colons, dots, dashes).
+    safe = re.sub(r"\b[A-Za-z0-9]{4,}:[0-9]{2,5}\b", "<DEVICE>", safe)
+    return safe
 
 
 def _validate_ssl_file(path_str: str | None) -> str | None:

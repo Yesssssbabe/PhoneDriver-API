@@ -25,7 +25,6 @@ import math
 import os
 import random
 import re
-import secrets
 import stat
 import subprocess
 import sys
@@ -124,6 +123,16 @@ class APIScrubFilter(logging.Filter):
         for pattern, repl in cls._PATTERNS:
             text = pattern.sub(repl, text)
         return text
+
+
+def _redact_error_message(message: str) -> str:
+    """Redact sensitive values from exception messages before logging/display."""
+    safe = re.sub(r"key=[a-zA-Z0-9_\-\.]+", "key=<REDACTED>", message)
+    safe = re.sub(r"(?i)sk-[a-zA-Z0-9]{20,}", "<API_KEY_REDACTED>", safe)
+    safe = re.sub(r"https?://[^\s\"']+", "<URL>", safe)
+    safe = re.sub(r"(/[a-zA-Z0-9_\-\.]+)+", "<PATH>", safe)
+    safe = re.sub(r"\b[A-Za-z0-9]{4,}:[0-9]{2,5}\b", "<DEVICE>", safe)
+    return safe
 
 
 def _setup_logging() -> None:
@@ -343,11 +352,11 @@ class ConfigResolver:
         # Provider compliance matrix (DPA / training opt-out).
         cfg["compliance"] = self._resolve_compliance(provider, cfg)
 
-        # Data residency: validate and optionally override endpoint.
+        # Data residency: validate residency value; endpoints are chosen by
+        # each provider implementation, so we only keep the validated region.
         residency = cfg.get("data_residency", "us")
         if residency not in self._RESIDENCY_ENDPOINTS:
             cfg["data_residency"] = "us"
-        cfg["provider_base_url"] = self._RESIDENCY_ENDPOINTS.get(residency, {}).get(provider, "")
 
         return cfg
 
@@ -704,7 +713,7 @@ class TaskOrchestrator:
                     return {"success": True, "message": "Task completed"}
 
                 # Add small random jitter to step_delay to mitigate timing side-channels.
-                jitter = secrets.SystemRandom().uniform(0, self.step_delay * 0.1) if self.step_delay > 0 else 0.0
+                jitter = random.SystemRandom().uniform(0, self.step_delay * 0.1) if self.step_delay > 0 else 0.0
                 time.sleep(self.step_delay + jitter)
 
                 # Periodic cleanup to avoid unbounded disk use during long tasks.
@@ -795,8 +804,12 @@ class PhoneAgent:
             sensitive_app_whitelist=self.config.get("sensitive_app_whitelist"),
         )
         self.vl_agent = self._create_provider()
-        # Let the provider coordinate screenshot read references with cleanup.
-        self.vl_agent._screenshot_capture = self.screenshot
+        # Register the screenshot capture helper via the provider's public setter
+        # instead of mutating a private attribute directly.
+        self.vl_agent.set_screenshot_capture(self.screenshot)
+        # Minimize API key exposure in the config dict: the provider already
+        # holds the key, and the orchestrator does not need it.
+        self.config.pop("api_key", None)
         self._init_screen_resolution()
 
         self._orchestrator = TaskOrchestrator(
@@ -998,16 +1011,21 @@ def main() -> None:
         except (KeyboardInterrupt, SystemExit):
             raise
         except Exception as exc:
-            safe_msg = re.sub(r"key=[a-zA-Z0-9_\-\.]+", "key=<REDACTED>", str(exc))
+            safe_msg = _redact_error_message(str(exc))
             logging.error("Fatal error: %s", safe_msg)
             sys.exit(1)
         finally:
             if agent is not None:
                 agent.cleanup()
     finally:
+        # Always close the lock file handle; unlocking is best-effort because
+        # the file may already be closed or invalid by this point.
+        try:
+            lock_file.close()
+        except Exception:
+            pass
         try:
             fcntl.flock(lock_file, fcntl.LOCK_UN)
-            lock_file.close()
         except Exception:
             pass
 

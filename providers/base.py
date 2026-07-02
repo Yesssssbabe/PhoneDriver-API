@@ -72,6 +72,13 @@ class BaseProvider(ABC):
     def close(self) -> None:
         """Release resources held by the provider. Subclasses may override."""
 
+    def set_screenshot_capture(self, capture: Any) -> None:
+        """Register a screenshot capture helper for read-reference tracking.
+
+        Subclasses that read screenshot files should override this method.
+        The default implementation is a no-op.
+        """
+
 
 class OpenAICompatibleProvider(BaseProvider):
     """Provider that uses an OpenAI-compatible ``/chat/completions`` endpoint."""
@@ -150,6 +157,10 @@ class OpenAICompatibleProvider(BaseProvider):
         """Close the underlying HTTP client if it supports close()."""
         if hasattr(self._client, 'close'):
             self._client.close()
+
+    def set_screenshot_capture(self, capture: Any) -> None:
+        """Register the screenshot capture helper for read-reference tracking."""
+        self._screenshot_capture = capture
 
     def _get_system_prompt(self) -> str:
         """Return the system prompt. Subclasses may override for customization."""
