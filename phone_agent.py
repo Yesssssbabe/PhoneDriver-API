@@ -60,6 +60,7 @@ from providers import get_provider
 from providers.base import BaseProvider
 from utils.adb import ADBClient
 from utils.screenshot import ScreenshotCapture
+from utils.security import redact_error_message
 
 
 # =============================================================================
@@ -123,16 +124,6 @@ class APIScrubFilter(logging.Filter):
         for pattern, repl in cls._PATTERNS:
             text = pattern.sub(repl, text)
         return text
-
-
-def _redact_error_message(message: str) -> str:
-    """Redact sensitive values from exception messages before logging/display."""
-    safe = re.sub(r"key=[a-zA-Z0-9_\-\.]+", "key=<REDACTED>", message)
-    safe = re.sub(r"(?i)sk-[a-zA-Z0-9]{20,}", "<API_KEY_REDACTED>", safe)
-    safe = re.sub(r"https?://[^\s\"']+", "<URL>", safe)
-    safe = re.sub(r"(/[a-zA-Z0-9_\-\.]+)+", "<PATH>", safe)
-    safe = re.sub(r"\b[A-Za-z0-9]{4,}:[0-9]{2,5}\b", "<DEVICE>", safe)
-    return safe
 
 
 def _setup_logging() -> None:
@@ -295,6 +286,11 @@ class ConfigResolver:
         },
     }
 
+    # In-memory cache for API keys resolved from the environment. After the
+    # first resolve we delete the environment variables to reduce /proc exposure;
+    # the cache allows repeated PhoneAgent creation in the same process.
+    _env_key_cache: Dict[str, str] = {}
+
     def __init__(self, config: Dict[str, Any], use_env_fallback: bool = True):
         self.config = config or {}
         self.use_env_fallback = use_env_fallback
@@ -377,11 +373,16 @@ class ConfigResolver:
         api_key = cfg.get("api_key")
         if api_key:
             return str(api_key)
+        cached = self._env_key_cache.get(provider)
+        if cached:
+            return cached
         if not self.use_env_fallback:
             return ""
         # Provider-specific env var, then generic API_KEY fallback.
         env_var = API_KEY_ENV_MAP.get(provider, "API_KEY")
         api_key = os.environ.get(env_var) or os.environ.get("API_KEY", "")
+        if api_key:
+            self._env_key_cache[provider] = api_key
         # Best-effort removal from the process environment to reduce /proc exposure.
         for key_name in set(API_KEY_ENV_MAP.values()) | {"API_KEY"}:
             if key_name in os.environ:
@@ -1011,7 +1012,7 @@ def main() -> None:
         except (KeyboardInterrupt, SystemExit):
             raise
         except Exception as exc:
-            safe_msg = _redact_error_message(str(exc))
+            safe_msg = redact_error_message(str(exc))
             logging.error("Fatal error: %s", safe_msg)
             sys.exit(1)
         finally:

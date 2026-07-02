@@ -313,9 +313,10 @@ class OpenAICompatibleProvider(BaseProvider):
             if content is None:
                 return None
             # Verify response integrity when a shared HMAC key is configured.
-            if hasattr(self._client, 'last_response_raw') and hasattr(self._client, 'last_response_headers'):
-                signature = self._client.last_response_headers.get("X-Response-Signature", "")
-                if not self._verify_response(self._client.last_response_raw, signature):
+            if hasattr(self._client, 'get_last_response'):
+                last_headers, last_raw = self._client.get_last_response()
+                signature = last_headers.get("X-Response-Signature", "")
+                if not self._verify_response(last_raw, signature):
                     logging.error("Response HMAC verification failed")
                     return None
             return self._parse_response(content)

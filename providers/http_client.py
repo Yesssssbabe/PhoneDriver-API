@@ -16,7 +16,7 @@ import threading
 import time
 from abc import ABC, abstractmethod
 from enum import Enum, auto
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 
@@ -131,10 +131,16 @@ class OpenAICompatibleClient(HttpClient):
             self.session.verify = True
         self.circuit_breaker = CircuitBreaker()
         self._session_lock = threading.Lock()
+        self._last_response_lock = threading.Lock()
         self._closing = False
         self._cost_tracker = {"total_tokens": 0, "total_cost_usd": 0.0}
         self.last_response_headers: Dict[str, str] = {}
         self.last_response_raw: bytes = b""
+
+    def get_last_response(self) -> Tuple[Dict[str, str], bytes]:
+        """Thread-safe read of the last response headers and raw body."""
+        with self._last_response_lock:
+            return self.last_response_headers.copy(), bytes(self.last_response_raw)
 
     def close(self) -> None:
         """Close the requests session and release connections."""
@@ -224,7 +230,8 @@ class OpenAICompatibleClient(HttpClient):
                         return None
 
                     resp.raise_for_status()
-                    self.last_response_headers = dict(resp.headers)
+                    with self._last_response_lock:
+                        self.last_response_headers = dict(resp.headers)
 
                     content_type = resp.headers.get("Content-Type", "")
                     if "application/json" not in content_type:
@@ -239,7 +246,8 @@ class OpenAICompatibleClient(HttpClient):
                             logging.error("Response body too large: %d bytes", len(raw))
                             self.circuit_breaker.record_failure()
                             return None
-                    self.last_response_raw = bytes(raw)
+                    with self._last_response_lock:
+                        self.last_response_raw = bytes(raw)
 
                     data = json.loads(raw)
                     usage = data.get("usage", {})
@@ -289,6 +297,30 @@ class OpenAICompatibleClient(HttpClient):
                 )
                 if self.circuit_breaker.record_failure():
                     break
+            except requests.exceptions.HTTPError as exc:
+                last_error = exc
+                status_code = exc.response.status_code if exc.response else 0
+                if 500 <= status_code < 600:
+                    logging.warning(
+                        "Server error %d on attempt %d/%d: %s",
+                        status_code,
+                        attempt,
+                        max_retries,
+                        exc,
+                    )
+                    # Occasional 5xx errors should not open the circuit breaker;
+                    # only record a failure on the final retry.
+                    if attempt == max_retries and self.circuit_breaker.record_failure():
+                        break
+                else:
+                    logging.warning(
+                        "HTTP error on attempt %d/%d: %s",
+                        attempt,
+                        max_retries,
+                        exc,
+                    )
+                    if self.circuit_breaker.record_failure():
+                        break
             except requests.exceptions.RequestException as exc:
                 last_error = exc
                 logging.warning(

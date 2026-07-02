@@ -16,6 +16,7 @@ from unittest.mock import MagicMock, patch
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import pytest
+import requests
 from PIL import Image
 
 from phone_agent import (
@@ -713,10 +714,10 @@ def test_task_orchestrator_budget_exceeded():
 
 
 def test_redact_error_message_strips_sensitive_values():
-    from phone_agent import _redact_error_message
+    from utils.security import redact_error_message
 
     raw = "key=sk-abc123 path=/home/user/secret URL=https://api.example.com device=ABCD:5555"
-    redacted = _redact_error_message(raw)
+    redacted = redact_error_message(raw)
     assert "sk-abc123" not in redacted
     assert "/home/user/secret" not in redacted
     assert "https://api.example.com" not in redacted
@@ -764,9 +765,10 @@ def test_http_client_sets_response_metadata_for_hmac():
             max_tokens=100,
         )
         assert content is not None
-        assert client.last_response_headers.get("X-Response-Signature") == "sig"
-        assert isinstance(client.last_response_raw, bytes)
-        assert b"action" in client.last_response_raw
+        last_headers, last_raw = client.get_last_response()
+        assert last_headers.get("X-Response-Signature") == "sig"
+        assert isinstance(last_raw, bytes)
+        assert b"action" in last_raw
 
 
 @pytest.mark.skipif(
@@ -781,6 +783,66 @@ def test_ui_demo_is_lazy_and_not_built_on_import():
     import ui
     assert ui._demo is None
     assert isinstance(ui.demo, ui._LazyDemo)
+
+
+@pytest.mark.skipif(
+    importlib.util.find_spec("gradio") is None,
+    reason="gradio is not installed in this environment",
+)
+def test_ui_resolve_api_key_prefers_config_over_env():
+    from phone_agent import API_KEY_ENV_MAP
+    from ui import _resolve_api_key
+
+    provider = "openai"
+    env_var = API_KEY_ENV_MAP.get(provider, "API_KEY")
+    with patch.dict(os.environ, {env_var: "env-key"}, clear=False):
+        # Config key should take precedence.
+        assert _resolve_api_key(provider, "config-key") == "config-key"
+        # When no config key is provided, env key is used and removed.
+        assert _resolve_api_key(provider) == "env-key"
+        assert env_var not in os.environ
+
+
+def test_config_resolver_env_key_cache_allows_repeated_creation():
+    from phone_agent import ConfigResolver
+
+    provider = "openai"
+    env_var = "OPENAI_API_KEY"
+    with patch.dict(os.environ, {env_var: "sk-cached"}, clear=False):
+        resolver1 = ConfigResolver({"provider": provider}, use_env_fallback=True)
+        assert resolver1.resolve()["api_key"] == "sk-cached"
+        # Env var has been deleted.
+        assert env_var not in os.environ
+        # Second resolver without config key should still get the cached key.
+        resolver2 = ConfigResolver({"provider": provider}, use_env_fallback=True)
+        assert resolver2.resolve()["api_key"] == "sk-cached"
+
+
+def test_http_client_5xx_does_not_open_circuit_on_first_retry():
+    import json as _json
+    from unittest.mock import MagicMock, patch
+    from providers.http_client import OpenAICompatibleClient
+
+    client = OpenAICompatibleClient(base_url="https://example.com/v1")
+    with patch.object(client.session, "post") as mock_post:
+        resp = MagicMock()
+        resp.status_code = 500
+        resp.headers = {"Content-Type": "application/json"}
+        resp.raise_for_status.side_effect = requests.exceptions.HTTPError(response=resp)
+        resp.__enter__ = MagicMock(return_value=resp)
+        resp.__exit__ = MagicMock(return_value=False)
+        mock_post.return_value = resp
+
+        content = client.chat_completion(
+            [{"role": "user", "content": "hi"}],
+            model="gpt-4o",
+            temperature=0.1,
+            max_tokens=100,
+            max_retries=3,
+        )
+        assert content is None
+        # Circuit breaker should not open on retriable 5xx errors.
+        assert client.circuit_breaker.state.name == "CLOSED"
 
 
 # Make os available for the ADB env patch test

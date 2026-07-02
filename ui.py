@@ -29,6 +29,7 @@ from dotenv import load_dotenv
 
 from phone_agent import API_KEY_ENV_MAP, APIScrubFilter, PhoneAgent
 from providers import available_providers
+from utils.security import redact_error_message
 
 
 # Configure module logger with API key scrubbing
@@ -202,12 +203,15 @@ def _build_config(
     return base
 
 
-def _resolve_api_key(provider: str) -> str:
-    """Read the API key from environment variables only.
+def _resolve_api_key(provider: str, config_key: str = "") -> str:
+    """Resolve the API key, preferring config.json over environment variables.
 
-    UI-supplied keys are never used. The corresponding environment variables
-    are removed from the process environment after reading.
+    UI-supplied keys are intentionally ignored. The corresponding environment
+    variables are removed from the process environment after reading.
     """
+    if config_key:
+        return str(config_key)
+
     env_var = API_KEY_ENV_MAP.get(provider, "API_KEY")
     env_key = os.environ.get(env_var) or os.environ.get("API_KEY", "")
     # Best-effort removal from the process environment to reduce /proc exposure.
@@ -225,7 +229,9 @@ def _resolve_api_key(provider: str) -> str:
 # =============================================================================
 def _execute_task(config: Dict[str, Any], task: str) -> str:
     """Instantiate PhoneAgent and execute the task."""
-    config["api_key"] = _resolve_api_key(config.get("provider", ""))
+    config["api_key"] = _resolve_api_key(
+        config.get("provider", ""), config.get("api_key", "")
+    )
     agent = PhoneAgent(config)
     try:
         result = agent.execute_task(task)
@@ -279,7 +285,7 @@ def run_task(
     try:
         return _execute_task(config, str(task))
     except Exception as exc:
-        safe_msg = _redact_error_message(str(exc))
+        safe_msg = redact_error_message(str(exc))
         logger.error("Task execution failed: %s", safe_msg)
         return f"Error: {type(exc).__name__}: {safe_msg}"
     finally:
@@ -382,6 +388,7 @@ def build_ui() -> gr.Blocks:
         - For production use, set API keys via environment variables instead of typing them here.
         - Screenshots are sent to cloud AI providers. Avoid tasks while sensitive information is visible.
         - Enable USB debugging only when actively using this tool and disable it afterward.
+        - Always run the Gradio UI over HTTPS in production by setting PHONEDRIVER_SSL_KEYFILE and PHONEDRIVER_SSL_CERTFILE.
 
         ### Provider Setup
         - **Kimi Code**: Get key from https://kimi.com/code/console
@@ -461,17 +468,6 @@ def _require_non_root() -> None:
             file=sys.stderr,
         )
         sys.exit(1)
-
-
-def _redact_error_message(message: str) -> str:
-    """Redact sensitive values from exception messages shown to users."""
-    safe = re.sub(r"key=[a-zA-Z0-9_\-\.]+", "key=<REDACTED>", message)
-    safe = re.sub(r"(?i)sk-[a-zA-Z0-9]{20,}", "<API_KEY_REDACTED>", safe)
-    safe = re.sub(r"https?://[^\s\"']+", "<URL>", safe)
-    safe = re.sub(r"(/[a-zA-Z0-9_\-\.]+)+", "<PATH>", safe)
-    # Redact likely ADB device identifiers (alphanumeric, colons, dots, dashes).
-    safe = re.sub(r"\b[A-Za-z0-9]{4,}:[0-9]{2,5}\b", "<DEVICE>", safe)
-    return safe
 
 
 def _validate_ssl_file(path_str: str | None) -> str | None:
