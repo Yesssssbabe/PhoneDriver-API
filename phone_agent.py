@@ -25,6 +25,7 @@ import math
 import os
 import random
 import re
+import secrets
 import stat
 import subprocess
 import sys
@@ -192,10 +193,47 @@ class OutputSafetyChecker:
         re.compile(r"(?i)(open.settings|change.password|disable.security)"),
     ]
 
+    # Expanded dangerous keywords for secondary semantic check.
+    DANGEROUS_KEYWORDS = {
+        "delete", "erase", "wipe", "format", "remove", "clear",
+        "uninstall", "factoryreset", "erasedata", "wipedata",
+        "uninstallall", "removeall", "clearall", "deleteall",
+        "wipeall", "eraseall",
+    }
+
+    # Pairs of keywords that, when present together, signal dangerous intent.
+    DANGEROUS_COMBOS = [
+        ("delete", "photo"),
+        ("delete", "image"),
+        ("delete", "video"),
+        ("delete", "contact"),
+        ("delete", "file"),
+        ("delete", "message"),
+        ("uninstall", "app"),
+        ("remove", "app"),
+        ("erase", "data"),
+        ("wipe", "data"),
+        ("clear", "data"),
+        ("format", "data"),
+        ("factory", "reset"),
+    ]
+
+    @classmethod
+    def _normalize(cls, text: str) -> str:
+        return re.sub(r"[\s_.]", "", text.lower())
+
     def check(self, action: Dict[str, Any]) -> bool:
         text = json.dumps(action)
         for pattern in self.DANGEROUS_PATTERNS:
             if pattern.search(text):
+                logging.warning("Dangerous action detected: %s", action)
+                return False
+        normalized = self._normalize(text)
+        if any(kw in normalized for kw in self.DANGEROUS_KEYWORDS):
+            logging.warning("Dangerous action detected: %s", action)
+            return False
+        for first, second in self.DANGEROUS_COMBOS:
+            if first in normalized and second in normalized:
                 logging.warning("Dangerous action detected: %s", action)
                 return False
         return True
@@ -213,6 +251,8 @@ class APIKeyManager:
         self._current = 0
 
     def get_key(self, scope: str = "default") -> str:
+        if not self.keys:
+            raise ValueError("No API keys configured")
         allowed = self.scopes.get(scope, [])
         for _ in range(len(self.keys)):
             key = self.keys[self._current % len(self.keys)]
@@ -278,7 +318,11 @@ class ConfigResolver:
         cfg["check_completion"] = bool(cfg.get("check_completion", True))
         cfg["auto_detect_resolution"] = bool(cfg.get("auto_detect_resolution", True))
         cfg.setdefault("max_api_calls", DEFAULT_MAX_API_CALLS)
-        cfg.setdefault("max_budget_usd", 10.0)
+        max_budget_usd = self._float(cfg.get("max_budget_usd"), 10.0)
+        if not math.isfinite(max_budget_usd):
+            logging.warning("Invalid max_budget_usd: %s, defaulting to 10.0", cfg.get("max_budget_usd"))
+            max_budget_usd = 10.0
+        cfg["max_budget_usd"] = max_budget_usd
         cfg.setdefault("data_residency", "us")
         cfg.setdefault("dpa_accepted", False)
         cfg.setdefault("device_fingerprint", "")
@@ -330,12 +374,10 @@ class ConfigResolver:
         env_var = API_KEY_ENV_MAP.get(provider, "API_KEY")
         api_key = os.environ.get(env_var) or os.environ.get("API_KEY", "")
         # Best-effort removal from the process environment to reduce /proc exposure.
-        if env_var in os.environ:
-            del os.environ[env_var]
-            os.unsetenv(env_var)
-        if "API_KEY" in os.environ:
-            del os.environ["API_KEY"]
-            os.unsetenv("API_KEY")
+        for key_name in set(API_KEY_ENV_MAP.values()) | {"API_KEY"}:
+            if key_name in os.environ:
+                del os.environ[key_name]
+                os.unsetenv(key_name)
         return api_key
 
     def _resolve_model(self, cfg: Dict[str, Any]) -> Optional[str]:
@@ -563,7 +605,21 @@ class TaskOrchestrator:
             self._key_manager = APIKeyManager(keys, config.get("api_key_scopes", {}))
 
     # Dangerous task keywords that require explicit operator override.
-    _DANGEROUS_KEYWORDS = {"factory reset", "erase all", "uninstall all", "wipe data"}
+    _DANGEROUS_KEYWORDS = {
+        "factoryreset",
+        "eraseall",
+        "uninstallall",
+        "wipedata",
+        "deleteall",
+        "removeall",
+        "clearall",
+        "wipeall",
+        "formatall",
+    }
+
+    @staticmethod
+    def _normalize_task_text(text: str) -> str:
+        return re.sub(r"[\s_.]", "", text.lower())
 
     def run(self, task: str) -> Dict[str, Any]:
         """Execute a task and return the result dict."""
@@ -572,9 +628,9 @@ class TaskOrchestrator:
         self._api_calls = 0
 
         # Block clearly destructive task descriptions unless explicitly allowed.
-        task_lower = task.lower()
+        normalized_task = self._normalize_task_text(task)
         if (
-            any(kw in task_lower for kw in self._DANGEROUS_KEYWORDS)
+            any(kw in normalized_task for kw in self._DANGEROUS_KEYWORDS)
             and not self.config.get("allow_dangerous_tasks", False)
         ):
             return {
@@ -611,6 +667,8 @@ class TaskOrchestrator:
                     and cycle >= 2
                     and self._check_completion(screenshot_path, task)
                 ):
+                    if not self._audit_recent_actions():
+                        return {"success": False, "message": "Completion blocked: dangerous action detected in recent history"}
                     return {"success": True, "message": "Task completed"}
                 self._api_calls += 1
 
@@ -646,7 +704,7 @@ class TaskOrchestrator:
                     return {"success": True, "message": "Task completed"}
 
                 # Add small random jitter to step_delay to mitigate timing side-channels.
-                jitter = random.uniform(0, self.step_delay * 0.1) if self.step_delay > 0 else 0.0
+                jitter = secrets.SystemRandom().uniform(0, self.step_delay * 0.1) if self.step_delay > 0 else 0.0
                 time.sleep(self.step_delay + jitter)
 
                 # Periodic cleanup to avoid unbounded disk use during long tasks.
@@ -665,6 +723,8 @@ class TaskOrchestrator:
 
     def _check_budget_exceeded(self) -> bool:
         """Check whether the configured USD budget has been exceeded."""
+        if not math.isfinite(self.max_budget_usd):
+            return False
         client = getattr(self.provider, "_client", None)
         if client is None or not hasattr(client, "_cost_tracker"):
             return False
@@ -684,12 +744,13 @@ class TaskOrchestrator:
 
     def _detect_action_loop(self) -> bool:
         """Detect repeated identical actions or short action cycles."""
-        if len(self.previous_actions) < 5:
+        window = min(20, len(self.previous_actions))
+        if window < 5:
             return False
-        recent = self.previous_actions[-5:]
+        recent = self.previous_actions[-window:]
         if all(a == recent[0] for a in recent):
             return True
-        for cycle_len in range(2, 5):
+        for cycle_len in range(2, min(11, window // 2 + 1)):
             if len(self.previous_actions) >= cycle_len * 2:
                 tail = self.previous_actions[-cycle_len * 2:]
                 if tail[:cycle_len] == tail[cycle_len:]:
@@ -706,6 +767,13 @@ class TaskOrchestrator:
         except (OSError, ValueError, TypeError) as exc:
             logging.warning("Completion check failed: %s", exc)
         return False
+
+    def _audit_recent_actions(self) -> bool:
+        """Audit the last up to 5 actions for dangerous output."""
+        for action in self.previous_actions[-5:]:
+            if not self._safety_checker.check(action):
+                return False
+        return True
 
 
 # =============================================================================

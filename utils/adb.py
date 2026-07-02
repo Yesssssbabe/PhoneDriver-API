@@ -28,6 +28,7 @@ MAX_DURATION = 30000
 MAX_KEYCODE = 300
 _REMOTE_SCREENSHOT_DIR = "/data/local/tmp"
 _DEVICE_ID_RE = re.compile(r"^[A-Za-z0-9:_\-.]+$")
+_SYSTEM_PATHS = {"/usr/bin", "/bin", "/usr/local/bin", "/usr/sbin", "/sbin"}
 
 
 class ADBClient:
@@ -78,8 +79,14 @@ class ADBClient:
         # Ensure a sane, minimal PATH so the real adb binary is found.
         if 'PATH' not in safe_env or not safe_env.get('PATH'):
             safe_env['PATH'] = '/usr/bin:/bin:/usr/local/bin'
-        # Remove world-writable directories from PATH to prevent binary hijacking.
+        # Remove world-writable or untrusted directories from PATH to prevent
+        # binary hijacking. Directories under system paths are allowed even if
+        # not owned by the current user.
         path = safe_env.get('PATH', '')
+        try:
+            current_uid = os.getuid()
+        except AttributeError:
+            current_uid = None
         safe_dirs = []
         for d in path.split(':'):
             if os.path.isdir(d):
@@ -87,6 +94,15 @@ class ADBClient:
                     st = os.stat(d)
                     if stat.S_IWOTH & st.st_mode:
                         logging.warning("World-writable PATH directory removed: %s", d)
+                        continue
+                    dir_uid = getattr(st, 'st_uid', None)
+                    if (
+                        dir_uid is not None
+                        and current_uid is not None
+                        and dir_uid != current_uid
+                        and d not in _SYSTEM_PATHS
+                    ):
+                        logging.warning("PATH directory not owned by user removed: %s", d)
                         continue
                 except OSError:
                     pass
@@ -96,21 +112,29 @@ class ADBClient:
 
     @staticmethod
     def _validate_adb_keys() -> None:
-        """Validate that adb_keys file is not world-writable or owned by another user."""
+        """Validate that adb key files are not world-readable/writable or owned by another user."""
         home = os.environ.get('HOME', '')
         if not home:
             return
-        adb_keys = Path(home) / '.android' / 'adb_keys'
-        if not adb_keys.exists():
-            return
+        adb_dir = Path(home) / '.android'
+        key_files = [adb_dir / name for name in ('adb_keys', 'adbkey', 'adbkey.pub')]
         try:
-            st = adb_keys.stat()
-        except OSError:
-            return
-        if stat.S_IWOTH & st.st_mode:
-            raise PermissionError(f"adb_keys file is world-writable: {adb_keys}")
-        if st.st_uid != os.getuid():
-            raise PermissionError(f"adb_keys file is not owned by current user: {adb_keys}")
+            current_uid = os.getuid()
+        except AttributeError:
+            current_uid = None
+        for key_file in key_files:
+            if not key_file.exists():
+                continue
+            try:
+                st = key_file.stat()
+            except OSError:
+                continue
+            if stat.S_IWOTH & st.st_mode:
+                raise PermissionError(f"adb key file is world-writable: {key_file}")
+            if stat.S_IROTH & st.st_mode:
+                raise PermissionError(f"adb key file is world-readable: {key_file}")
+            if current_uid is not None and st.st_uid != current_uid:
+                raise PermissionError(f"adb key file is not owned by current user: {key_file}")
 
     @staticmethod
     def _sanitize_cmd(cmd: list) -> str:
@@ -193,12 +217,27 @@ class ADBClient:
             return future.result(timeout=timeout)
         except concurrent.futures.TimeoutError:
             future.cancel()
+            # Wait for the running future to finish rather than leaving it dangling.
+            try:
+                concurrent.futures.wait([future], timeout=5)
+            except Exception:
+                pass
             logging.error("ADB command forcefully timed out: %s", self._sanitize_cmd(command))
             raise subprocess.TimeoutExpired(command, timeout)
 
     def close(self) -> None:
         """Release the executor used for hard timeouts."""
-        self._executor.shutdown(wait=False)
+        # Shutdown with wait=True, but cap the wait at 5 seconds so an in-flight
+        # ADB command cannot block the caller indefinitely.
+        shutdown_done = threading.Event()
+
+        def _shutdown() -> None:
+            self._executor.shutdown(wait=True)
+            shutdown_done.set()
+
+        thread = threading.Thread(target=_shutdown, daemon=True)
+        thread.start()
+        shutdown_done.wait(timeout=5)
 
     def _shell(self, command: str) -> str:
         """Run an allowed ADB shell command.
@@ -307,18 +346,24 @@ class ADBClient:
     def _type_via_clipboard(self, text: str) -> None:
         """Fallback: type text using clipboard paste.
 
-        The text is escaped for Intent extras to reduce the risk of shell/Intent
-        injection through ``am broadcast``.
+        The text is escaped so the shell does not interpret metacharacters such
+        as ``$``, ``;``, or backticks, preventing shell/Intent injection through
+        ``am broadcast``. Semicolons are forced into a double-quoted token so
+        they cannot be parsed as command separators.
         """
         try:
-            # Escape backslashes and quotes, then escape non-printable characters.
-            safe_text = text.replace('\\', '\\\\').replace('"', '\\"').replace("'", "\\'")
-            safe_text = "".join(
-                c if c.isprintable() or c in '\t\n ' else '\\u' + format(ord(c), '04x')
-                for c in safe_text
-            )
+            quoted = shlex.quote(text)
+            if ';' in quoted:
+                # Escape characters that retain special meaning inside double quotes.
+                escaped = (
+                    text.replace('\\', '\\\\')
+                    .replace('"', '\\"')
+                    .replace('`', '\\`')
+                    .replace('$', '\\$')
+                )
+                quoted = f'"{escaped}"'
             self._run_shell_input(
-                f'am broadcast -a clipper.set -e text "{safe_text}"',
+                f'am broadcast -a clipper.set -e text {quoted}',
                 check=True,
             )
             # KEYCODE_PASTE (279) attempts to paste into focused field

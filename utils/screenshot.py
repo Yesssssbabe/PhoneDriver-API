@@ -2,6 +2,7 @@
 
 import logging
 import os
+import re
 import stat
 import sys
 import tempfile
@@ -45,7 +46,17 @@ def _is_junction(path: Path) -> bool:
         FILE_ATTRIBUTE_REPARSE_POINT = 0x400
         kernel32 = ctypes.windll.kernel32
         attrs = kernel32.GetFileAttributesW(ctypes.c_wchar_p(str(path)))
-        return attrs != 0xFFFFFFFF and (attrs & FILE_ATTRIBUTE_REPARSE_POINT) != 0
+        if attrs != 0xFFFFFFFF:
+            return (attrs & FILE_ATTRIBUTE_REPARSE_POINT) != 0
+    except Exception:
+        pass
+    # Fallback: use lstat mode checks when kernel32 is unavailable or fails.
+    try:
+        st = os.lstat(str(path))
+        if hasattr(st, "st_file_attributes"):
+            reparse = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+            return bool(st.st_file_attributes & reparse)
+        return stat.S_ISLNK(st.st_mode)
     except Exception:
         return False
 
@@ -80,10 +91,16 @@ class ScreenshotCapture:
         adb: ADBClient,
         save_dir: str = DEFAULT_SAVE_DIR,
         sensitive_app_whitelist: Optional[list] = None,
+        allow_unknown_app_screenshots: Optional[bool] = None,
     ):
         self.adb = adb
         self.save_dir = _validate_save_dir(Path(save_dir))
         self._sensitive_app_whitelist = set(sensitive_app_whitelist or [])
+        if allow_unknown_app_screenshots is None:
+            allow_unknown_app_screenshots = (
+                os.environ.get("PHONEDRIVER_ALLOW_UNKNOWN_APP_SCREENSHOTS") == "1"
+            )
+        self._allow_unknown_app_screenshots = allow_unknown_app_screenshots
 
         # Reject symlinked directories to prevent arbitrary file writes
         if self.save_dir.is_symlink():
@@ -157,19 +174,53 @@ class ScreenshotCapture:
             os.close(fd)
             raise
 
+    def _get_status_bar_height(self) -> Optional[int]:
+        """Query the device for the status bar height; return None on failure."""
+        try:
+            rc, stdout, _ = self.adb.run(
+                ['shell', 'dumpsys window | grep -E "StatusBar|mStableInsets"'],
+                check=False,
+            )
+            if rc != 0 or not isinstance(stdout, str):
+                return None
+            # StatusBar=Rect(0, 0 - 1080, 80)
+            match = re.search(r'StatusBar.*?Rect\(\d+,\s*\d+\s*-\s*\d+,\s*(\d+)\)', stdout)
+            if match:
+                return int(match.group(1))
+            # mStableInsets=Rect(0, 80 - 0, 0)
+            match = re.search(
+                r'mStableInsets=Rect\(\d+,\s*(\d+)\s*-\s*\d+,\s*\d+\)',
+                stdout,
+                re.IGNORECASE,
+            )
+            if match:
+                return int(match.group(1))
+        except Exception:
+            pass
+        return None
+
     def _strip_notification_bar(self, img: Image.Image) -> Image.Image:
         """Crop the top notification bar out of the screenshot."""
         width, height = img.size
-        notification_height = min(100, height // 10)
+        notification_height = self._get_status_bar_height()
+        if notification_height is None:
+            notification_height = min(100, height // 10)
         if notification_height >= height:
             return img
         return img.crop((0, notification_height, width, height))
 
     def _check_sensitive_app(self) -> None:
-        """Raise PermissionError if the foreground app is sensitive."""
+        """Raise PermissionError if the foreground app is sensitive.
+
+        Fail-safe: if the foreground app cannot be determined, block the
+        screenshot unless the caller has explicitly enabled unknown-app
+        screenshots.
+        """
         current_pkg = self.adb.get_current_window()
         if not current_pkg:
-            return
+            if self._allow_unknown_app_screenshots:
+                return
+            raise PermissionError("Cannot determine foreground app; screenshot blocked")
         if current_pkg in self._sensitive_app_whitelist:
             return
         if any(pkg in current_pkg for pkg in _SENSITIVE_PACKAGES):

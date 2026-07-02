@@ -1,0 +1,19 @@
+# requirements-lock.txt
+# Exact pins with SHA-256 hashes for the top-level dependencies in requirements.txt.
+# Install with: pip install --require-hashes -r requirements-lock.txt
+
+requests==2.32.3 \
+    --hash=sha256:70761cfe03c773ceb22aa2f671b4757976145175cdfca038c02654d061d6dcc6 \
+    --hash=sha256:55365417734eb18255590a9ff9eb97e9e1da868d4ccd6402399eaf68af20a760
+
+Pillow==12.2.0 \
+    --hash=sha256:84a92b2ec95172d44bb937858d8143f87f0935d43ed3501c9f2c05e09c5f5db3 \
+    --hash=sha256:6822751cec85187089176b250f4a5818f65e88bee27b8061cedd7544e509ae8a
+
+python-dotenv==1.1.0 \
+    --hash=sha256:d7c01d9e2293916c18baf562d95698754b0dbbb5e74d457c45d4f6561fb9d55d \
+    --hash=sha256:41f90bc6f5f177fb41f53e87666db362025010eb28f60a01c9143bfa33a2b2d5
+
+gradio==6.7.0 \
+    --hash=sha256:940076fac276454926e663059b6d43fd2d9eeea4a56bf4231d0215d6a851882c \
+    --hash=sha256:a0a7e911571f00163a35a0d9b6811a444f7bf4c95cfd294eb506a3c054e9fa66

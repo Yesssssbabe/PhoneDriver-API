@@ -180,6 +180,18 @@ class OpenAICompatibleProvider(BaseProvider):
         sanitized = re.sub(r'\s+', ' ', sanitized).strip()
         return sanitized
 
+    @staticmethod
+    def _validate_system_prompt(prompt: str) -> bool:
+        """Return False if the prompt contains injection patterns or control chars."""
+        if not isinstance(prompt, str):
+            return False
+        if _CONTROL_CHAR_RE.search(prompt):
+            return False
+        for pattern in _INJECTION_PATTERNS:
+            if pattern.search(prompt):
+                return False
+        return True
+
     def _build_history(self, context: Optional[Dict[str, Any]]) -> str:
         """Build action history string."""
         if not context:
@@ -254,6 +266,10 @@ class OpenAICompatibleProvider(BaseProvider):
         """Call provider API through the HTTP client."""
         system_prompt = system_prompt or self.system_prompt
         max_tokens = max_tokens or self.max_tokens
+
+        if system_prompt and not self._validate_system_prompt(system_prompt):
+            logging.warning("System prompt failed injection validation; falling back to default")
+            system_prompt = self.DEFAULT_SYSTEM_PROMPT
 
         try:
             base64_image = self._encode_image(screenshot_path)
@@ -330,16 +346,33 @@ class OpenAICompatibleProvider(BaseProvider):
             logging.error("Response too large: %d bytes", len(content))
             return None
         try:
-            # Prefer markdown fence content if present
+            # First, try parsing the entire content as JSON.
+            data = json.loads(content)
+            return self._normalize_action(data)
+        except (json.JSONDecodeError, ValueError, TypeError):
+            pass
+
+        try:
+            # Try markdown fence content if present.
             json_match = re.search(r"```json\s*(\{.*?\})\s*```", content, re.DOTALL)
             if json_match:
-                json_str = json_match.group(1)
-            else:
-                json_str = self._extract_json(content)
-                if json_str is None:
-                    json_str = content.strip()
+                data = json.loads(json_match.group(1))
+                return self._normalize_action(data)
+        except (json.JSONDecodeError, ValueError, TypeError):
+            pass
 
-            data = json.loads(json_str)
+        try:
+            # Fall back to the string-aware JSON extractor.
+            json_str = self._extract_json(content)
+            if json_str is not None:
+                data = json.loads(json_str)
+                return self._normalize_action(data)
+        except (json.JSONDecodeError, ValueError, TypeError):
+            pass
+
+        try:
+            # Final fallback: parse the stripped content.
+            data = json.loads(content.strip())
             return self._normalize_action(data)
         except (json.JSONDecodeError, ValueError, TypeError) as exc:
             logging.error("Failed to parse response: %s", exc)

@@ -105,6 +105,13 @@ def save_config(config: Dict[str, Any]) -> None:
                 f.flush()
                 os.fsync(f.fileno())
             os.replace(tmp_path, CONFIG_PATH)
+            try:
+                if CONFIG_PATH.is_file():
+                    st = CONFIG_PATH.stat()
+                    if hasattr(os, "getuid") and st.st_uid == os.getuid():
+                        os.chmod(CONFIG_PATH, 0o600)
+            except OSError as exc:
+                logger.warning("Failed to set restrictive config permissions: %s", exc)
         except OSError as exc:
             logger.warning("Config save failed: %s", exc)
             try:
@@ -432,6 +439,44 @@ def _require_non_root() -> None:
         sys.exit(1)
 
 
+def _validate_ssl_file(path_str: str | None) -> str | None:
+    """Validate an SSL key/certificate path before passing it to Gradio.
+
+    The path must be inside the current working directory, must be a regular
+    file (not a symlink), must be owned by the current user, and must not be
+    world-readable or world-writable.
+    """
+    if not path_str:
+        return None
+    try:
+        p = Path(path_str)
+        if not p.is_absolute():
+            p = Path.cwd() / p
+        p = p.resolve()
+        cwd = Path.cwd().resolve()
+        p.relative_to(cwd)
+
+        st = p.lstat()
+        if not stat.S_ISREG(st.st_mode):
+            logger.error("SSL file is not a regular file: %s", path_str)
+            return None
+        if p.is_symlink():
+            logger.error("SSL file must not be a symlink: %s", path_str)
+            return None
+        if hasattr(os, "getuid") and st.st_uid != os.getuid():
+            logger.error("SSL file must be owned by the current user: %s", path_str)
+            return None
+        if (stat.S_IROTH & st.st_mode) or (stat.S_IWOTH & st.st_mode):
+            logger.error(
+                "SSL file must not be world-readable or world-writable: %s", path_str
+            )
+            return None
+        return str(p)
+    except (OSError, ValueError) as exc:
+        logger.error("Invalid SSL file path %r: %s", path_str, exc)
+        return None
+
+
 if __name__ == "__main__":
     _require_non_root()
 
@@ -454,8 +499,8 @@ if __name__ == "__main__":
     auth_pass = os.environ.get("PHONEDRIVER_PASS")
     auth = (auth_user, auth_pass) if auth_user and auth_pass else None
 
-    ssl_keyfile = os.environ.get("PHONEDRIVER_SSL_KEYFILE") or None
-    ssl_certfile = os.environ.get("PHONEDRIVER_SSL_CERTFILE") or None
+    ssl_keyfile = _validate_ssl_file(os.environ.get("PHONEDRIVER_SSL_KEYFILE"))
+    ssl_certfile = _validate_ssl_file(os.environ.get("PHONEDRIVER_SSL_CERTFILE"))
     if not ssl_keyfile or not ssl_certfile:
         logging.warning(
             "SSL not configured. Consider setting PHONEDRIVER_SSL_KEYFILE and "

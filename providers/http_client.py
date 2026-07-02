@@ -64,8 +64,9 @@ class CircuitBreaker:
                 return True
             if self.state == CircuitState.OPEN:
                 if time.monotonic() - self.last_failure_time > self.recovery_timeout:
+                    # Transition to HALF_OPEN and atomically claim the single probe.
                     self.state = CircuitState.HALF_OPEN
-                    self._half_open_probe = False
+                    self._half_open_probe = True
                     return True
                 return False
             # HALF_OPEN: only a single probe is allowed.
@@ -104,8 +105,13 @@ class OpenAICompatibleClient(HttpClient):
 
     _MODEL_PRICING = {
         "gpt-4o": {"input": 0.005, "output": 0.015},
-        "kimi-for-coding": {"input": 0.003, "output": 0.009},
+        "gpt-4o-mini": {"input": 0.00015, "output": 0.0006},
+        "gpt-4-turbo": {"input": 0.01, "output": 0.03},
         "kimi-k2.5": {"input": 0.003, "output": 0.009},
+        "kimi-for-coding": {"input": 0.003, "output": 0.009},
+        "moonshot-v1-8k": {"input": 0.003, "output": 0.009},
+        "moonshot-v1-32k": {"input": 0.006, "output": 0.018},
+        "moonshot-v1-128k": {"input": 0.012, "output": 0.036},
         "moonshotai/kimi-k2.5": {"input": 0.003, "output": 0.009},
     }
 
@@ -222,12 +228,14 @@ class OpenAICompatibleClient(HttpClient):
                         self.circuit_breaker.record_failure()
                         return None
 
-                    raw = resp.raw.read(MAX_RESPONSE_BYTES + 1)
-                    self.last_response_raw = raw
-                    if len(raw) > MAX_RESPONSE_BYTES:
-                        logging.error("Response body too large: %d bytes", len(raw))
-                        self.circuit_breaker.record_failure()
-                        return None
+                    raw = bytearray()
+                    for chunk in resp.iter_content(chunk_size=8192):
+                        raw.extend(chunk)
+                        if len(raw) > MAX_RESPONSE_BYTES:
+                            logging.error("Response body too large: %d bytes", len(raw))
+                            self.circuit_breaker.record_failure()
+                            return None
+                    self.last_response_raw = bytes(raw)
 
                     data = json.loads(raw)
                     usage = data.get("usage", {})

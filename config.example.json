@@ -7,5 +7,30 @@
   "max_retries": 3,
   "temperature": 0.1,
   "max_tokens": 512,
-  "auto_detect_resolution": true
+  "auto_detect_resolution": true,
+
+  "_security_field_comments": {
+    "max_budget_usd": "Maximum total USD spend before tasks are stopped (budget guardrail).",
+    "dpa_accepted": "Whether the user has accepted the Data Processing Agreement for providers that require it.",
+    "device_fingerprint": "Expected ADB device fingerprint; tasks abort if the connected device does not match.",
+    "sensitive_app_whitelist": "List of package names that are allowed to be screenshotted despite sensitive heuristics.",
+    "allow_dangerous_tasks": "When false, blocks tasks that match dangerous keywords (e.g., factory reset).",
+    "ssl_keyfile": "Path to the TLS private key file used by the Gradio UI (must be owned by the user, not world-readable).",
+    "ssl_certfile": "Path to the TLS certificate file used by the Gradio UI (must be owned by the user, not world-readable).",
+    "max_api_calls": "Maximum number of LLM API calls allowed within a single task.",
+    "check_completion": "Whether to run an extra completion-check API call after each action.",
+    "data_residency": "Preferred data residency region (e.g., 'us' or 'eu'); affects provider endpoint selection.",
+    "api_key_scopes": "Mapping of provider names to allowed API key scope names for key-rotation policies."
+  },
+  "max_budget_usd": 10.0,
+  "dpa_accepted": false,
+  "device_fingerprint": "",
+  "sensitive_app_whitelist": [],
+  "allow_dangerous_tasks": false,
+  "ssl_keyfile": "",
+  "ssl_certfile": "",
+  "max_api_calls": 200,
+  "check_completion": true,
+  "data_residency": "us",
+  "api_key_scopes": {}
 }
